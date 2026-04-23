@@ -37,7 +37,10 @@ prompt = open('test-prompt.txt').read().strip()
 negative_prompt = open('neg-prompt.txt').read().strip()
 
 if args.init:
-    img2img = StableDiffusionImg2ImgPipeline(**pipe.components)
+    img2img = StableDiffusionImg2ImgPipeline(
+        **pipe.components,
+        requires_safety_checker=False,
+    )
     init_image = Image.open(args.init).convert("RGB").resize((512, 512))
     stem = "i2i"
     def generate(generator):
@@ -48,8 +51,6 @@ if args.init:
             guidance_scale=args.guidance,
             num_inference_steps=args.steps,
             negative_prompt=negative_prompt,
-            safety_checker=None,
-            requires_safety_checker=False,
             generator=generator,
         ).images[0]
 else:
@@ -61,8 +62,6 @@ else:
             num_inference_steps=args.steps,
             num_images_per_prompt=1,
             negative_prompt=negative_prompt,
-            safety_checker=None,
-            requires_safety_checker=False,
             generator=generator,
         ).images[0]
 
