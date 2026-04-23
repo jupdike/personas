@@ -3,3 +3,4 @@ models/todo/*.safetensors
 .DS_Store
 .venv/
 __pycache__/
+output/*
