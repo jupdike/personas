@@ -15,8 +15,9 @@ pipe = StableDiffusionPipeline.from_single_file(
 pipe = pipe.to("mps")
 
 prompt = open('test-prompt.txt').read().strip()
+negative_prompt = open('neg-prompt.txt').read().strip()
 N=1
 
 for i in range(N):
-    image = pipe(prompt, num_inference_steps=25, num_images_per_prompt=1, negative_prompt="nsfw").images[0]
+    image = pipe(prompt, num_inference_steps=25, num_images_per_prompt=1, negative_prompt=negative_prompt).images[0]
     image.save(f"output/{timestamped_filename(f'out-{i}')}")

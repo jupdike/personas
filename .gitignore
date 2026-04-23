@@ -5,3 +5,4 @@ models/todo/*.safetensors
 __pycache__/
 output/*
 test-prompt.txt
+neg-prompt.txt
