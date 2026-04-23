@@ -21,3 +21,11 @@ The final capability would be to allow more control of faces, similar to the ble
 ### C. Back to Swift
 
 For now this exploration will be done with Python SD, diffusers, PyTorch, MPS device (on Mac with M1 Pro chip, for training and inference). If possible, it would be good to bring this back to CoreML to run with Mochi Diffusion and other Swift-based SD implementations, converting the models, injecting the pseudo-token, etc. It probably doesn't need to run on iPad, just the Mac.
+
+## Project Structure
+
+The project will be structured as follows:
+
+- `models/`: the folder where `.safetensor` SD 1.5 checkpoint models live.
+- `src/`: Python source code goes here
+
