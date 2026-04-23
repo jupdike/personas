@@ -2,7 +2,11 @@ import argparse
 import random
 
 import torch
-from diffusers import StableDiffusionImg2ImgPipeline, StableDiffusionPipeline
+from diffusers import (
+    DPMSolverMultistepScheduler,
+    StableDiffusionImg2ImgPipeline,
+    StableDiffusionPipeline,
+)
 from PIL import Image
 
 from util import timestamped_filename
@@ -32,6 +36,12 @@ pipe = StableDiffusionPipeline.from_single_file(
     torch_dtype=torch.float32,  # fp16 is flaky on MPS — stick to fp32 initially
 )
 pipe = pipe.to("mps")
+
+pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+    pipe.scheduler.config,
+    use_karras_sigmas=True,
+    algorithm_type="dpmsolver++",
+)
 
 prompt = open('test-prompt.txt').read().strip()
 negative_prompt = open('neg-prompt.txt').read().strip()
