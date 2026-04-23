@@ -1,0 +1,18 @@
+# Safetensors
+
+https://civitai.com/models/25694/epicrealism
+https://civitai.com/models/21813/edge-of-realism?modelVersionId=51904
+
+https://civitai.com/models/132632/epicphotogasm?modelVersionId=201259
+https://huggingface.co/Yntec/epiCPhotoGasm (older?)
+
+https://civitai.com/models/4201?modelVersionId=130072 (realisticVision)
+
+VAE encoder for img2img
+https://huggingface.co/stabilityai/sd-vae-ft-mse-original
+
+# CoreML converted
+
+https://huggingface.co/coreml-community/coreml-realisticVision-v51VAE_cn
+https://huggingface.co/coreml-community/coreml-epiCPhotoGasm-zUniversal_cn?not-for-all-audiences=true
+https://huggingface.co/coreml-community/coreml-EdgeOfRealism
