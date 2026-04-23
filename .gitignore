@@ -1,3 +1,5 @@
 models/*.safetensors
 models/todo/*.safetensors
 .DS_Store
+.venv/
+__pycache__/
