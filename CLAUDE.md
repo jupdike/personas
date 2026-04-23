@@ -29,3 +29,8 @@ The project will be structured as follows:
 - `models/`: the folder where `.safetensor` SD 1.5 checkpoint models live.
 - `src/`: Python source code goes here
 
+
+### Comments from Claude Code in Another Conversation
+
+One subtle thing to keep in mind: the pseudo-token manifold isn't necessarily Euclidean — angle/direction often matters more than magnitude (CLIP has been shown to behave this way). So if you fit a Gaussian and sample, you might want to renormalize samples to a typical magnitude of the training set. Little tricks like that will probably matter more than architectural choices at this scale.
+
