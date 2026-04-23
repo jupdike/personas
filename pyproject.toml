@@ -1,8 +1,14 @@
+[project]
+name = "personas"
+version = "0.1.0"
+requires-python = ">=3.14"
+
 [dependency-groups]
 dev = [
     "accelerate>=1.13.0",
     "diffusers>=0.37.1",
     "safetensors>=0.7.0",
     "torch>=2.11.0",
+    "torchvision>=0.26.0",
     "transformers>=5.6.1",
 ]
