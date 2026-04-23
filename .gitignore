@@ -4,3 +4,4 @@ models/todo/*.safetensors
 .venv/
 __pycache__/
 output/*
+test-prompt.txt
