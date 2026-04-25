@@ -12,11 +12,11 @@ from PIL import Image, PngImagePlugin
 from util import timestamped_filename, last_path_component, xmp_description_packet
 
 EDGE_OF_REALISM_MODEL_PATH = "models/edgeOfRealism_eorV20BakedVAE.safetensors"
-EPIC_PREALISM_MODEL_PATH = "models/epicrealism_naturalSinRC1VAE.safetensors"
+EPIC_REALISM_MODEL_PATH = "models/epicrealism_naturalSinRC1VAE.safetensors"
 
 # pick a model
-model_path = EDGE_OF_REALISM_MODEL_PATH
-#model_path = EPIC_PREALISM_MODEL_PATH
+#model_path = EDGE_OF_REALISM_MODEL_PATH
+model_path = EPIC_REALISM_MODEL_PATH
 # end pick a model
 
 model_name = last_path_component(model_path)
