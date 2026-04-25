@@ -17,7 +17,8 @@ model_name = last_path_component(EDGE_OF_REALISM_MODEL_PATH)
 EPIC_PREALISM_MODEL_PATH = "models/epicrealism_naturalSinRC1VAE.safetensors"
 model_name = last_path_component(EPIC_PREALISM_MODEL_PATH)
 
-model_path = EPIC_PREALISM_MODEL_PATH
+model_path = EDGE_OF_REALISM_MODEL_PATH
+#model_path = EPIC_PREALISM_MODEL_PATH
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--init", help="Path to init image for img2img mode")
@@ -28,7 +29,6 @@ parser.add_argument("--strength", type=float, default=0.6,
                     help="img2img strength: 0.0 = identity, 1.0 = ignore init image")
 parser.add_argument("-n", type=int, default=1, help="Number of images to generate")
 args = parser.parse_args()
-
 
 def resolve_seed(s: int) -> int:
     return random.randint(1, 2**31 - 1) if s == 0 else s
@@ -48,7 +48,7 @@ pipe.scheduler = DPMSolverMultistepScheduler.from_config(
     algorithm_type="dpmsolver++",
 )
 
-prompt = open('test-prompt.txt').read().strip()
+prompts = [x.strip() for x in open('test-prompt.txt').read().strip().splitlines() if x.strip() != '' and not x.strip().startswith("#")]
 negative_prompt = open('neg-prompt.txt').read().strip()
 
 if args.init:
@@ -58,9 +58,9 @@ if args.init:
     )
     init_image = Image.open(args.init).convert("RGB").resize((512, 512))
     stem = "i2i"
-    def generate(generator):
+    def generate(generator, p):
         return img2img(
-            prompt=prompt,
+            p,
             image=init_image,
             strength=args.strength,
             guidance_scale=args.guidance,
@@ -70,9 +70,9 @@ if args.init:
         ).images[0]
 else:
     stem = "out"
-    def generate(generator):
+    def generate(generator, p):
         return pipe(
-            prompt,
+            p,
             guidance_scale=args.guidance,
             num_inference_steps=args.steps,
             num_images_per_prompt=1,
@@ -80,14 +80,17 @@ else:
             generator=generator,
         ).images[0]
 
-for i in range(args.n):
-    seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
-    parameters = f"Include in Image: {prompt}; Exclude from Image: {negative_prompt}; Model: {model_name}; Steps: {args.steps}; Guidance Scale: {args.guidance}; Seed: {seed}; Size: 512x512; Scheduler: DPM-Solver++; ML Compute Unit: MPS; Generator: Personas 0.1 + HuggingFace diffusers"
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    image = generate(generator)
-    png_meta = PngImagePlugin.PngInfo()
-    png_meta.add_text("Description", parameters)
-    png_meta.add_text("parameters", parameters)
-    png_meta.add_text("Software", "Personas 0.1 + HuggingFace diffusers")
-    png_meta.add_itxt("XML:com.adobe.xmp", xmp_description_packet(parameters), lang="", tkey="")
-    image.save(f"output/{timestamped_filename(f'{stem}-{seed}')}", pnginfo=png_meta)
+print(f"<> Found {len(prompts)} prompts.")
+for p in prompts:
+    print(f"=== Prompt: {p} ===")
+    for i in range(args.n):
+        seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
+        parameters = f"Include in Image: {p}; Exclude from Image: {negative_prompt}; Model: {model_name}; Steps: {args.steps}; Guidance Scale: {args.guidance}; Seed: {seed}; Size: 512x512; Scheduler: DPM-Solver++; ML Compute Unit: MPS; Generator: Personas 0.1 + HuggingFace diffusers"
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        image = generate(generator, p)
+        png_meta = PngImagePlugin.PngInfo()
+        png_meta.add_text("Description", parameters)
+        png_meta.add_text("parameters", parameters)
+        png_meta.add_text("Software", "Personas 0.1 + HuggingFace diffusers")
+        png_meta.add_itxt("XML:com.adobe.xmp", xmp_description_packet(parameters), lang="", tkey="")
+        image.save(f"output/{timestamped_filename(f'{stem}-{seed}')}", pnginfo=png_meta)
