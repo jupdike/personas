@@ -1,0 +1,166 @@
+"""Render images with a trained pseudo-token spliced into the CLIP embedding table.
+
+Loads a `.pt` produced by train-pseudo-token.py, registers the placeholder string
+with the tokenizer, writes the learned 768-vector into the placeholder row, and
+runs Stable Diffusion on a list of prompts containing that placeholder.
+
+Defaults to the validation prompt set described in PLAN.md.
+"""
+import argparse
+import random
+from pathlib import Path
+
+import torch
+from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
+from PIL import PngImagePlugin
+
+from models import experiment_path, model_name, model_path
+from util import timestamped_filename, xmp_description_packet
+
+
+# Default validation prompts. {tok} is replaced with the placeholder string.
+DEFAULT_VALIDATION_PROMPTS = [
+    # Solo fidelity
+    "a photo of {tok}",
+    "portrait of {tok}",
+    # Novel scene composition
+    "{tok}, medieval armor, castle courtyard",
+    "{tok}, reading a book, library interior",
+    "{tok}, hiking on a mountain trail, golden hour",
+    # Modifier compatibility
+    "{tok}, in the style of Vermeer",
+    "{tok}, pencil sketch, textured paper",
+    # Token-budget check
+    "{tok}, sitting at a cafe, autumn leaves falling, golden afternoon light, "
+    "holding a book, shallow depth of field, film grain",
+]
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--token-file", required=True,
+                   help="Path to the .pt produced by train-pseudo-token.py")
+    p.add_argument("--steps", type=int, default=25)
+    p.add_argument("--guidance", type=float, default=7.5)
+    p.add_argument("--seed", type=int, default=0,
+                   help="Base seed; 0 = random per image")
+    p.add_argument("-n", type=int, default=1, help="Images per prompt")
+    p.add_argument("--prompts-file", default=None,
+                   help="Optional path to a text file of prompts (one per line, "
+                        "use {tok} placeholder). Lines starting with # are ignored.")
+    p.add_argument("--dtype", choices=["fp32", "fp16"], default="fp16")
+    p.add_argument("--out-dir", default="output",
+                   help="Directory to save rendered PNGs")
+    p.add_argument("--neg-prompt-file", default="neg-prompt.txt")
+    return p.parse_args()
+
+
+def resolve_seed(s: int) -> int:
+    return random.randint(1, 2**31 - 1) if s == 0 else s
+
+
+def load_prompts(path: str | None) -> list[str]:
+    if path is None:
+        return list(DEFAULT_VALIDATION_PROMPTS)
+    lines = Path(path).read_text().splitlines()
+    return [line.strip() for line in lines
+            if line.strip() and not line.strip().startswith("#")]
+
+
+def main():
+    args = parse_args()
+    device = "mps"
+    dtype = torch.float32 if args.dtype == "fp32" else torch.float16
+
+    payload = torch.load(args.token_file, map_location="cpu", weights_only=False)
+    placeholder = payload["token"]
+    learned = payload["embedding"].float()  # [768]
+    saved_ckpt = payload.get("checkpoint_name")
+    if saved_ckpt and saved_ckpt != model_name:
+        print(f"<> WARNING: token was trained against {saved_ckpt!r} but current "
+              f"checkpoint is {model_name!r}. Pseudo-tokens are coupled to U-Net "
+              "weights — results may be poor.")
+    print(f"<> Token: {placeholder} (||emb||={learned.norm().item():.3f})")
+    print(f"<> Trained against: {saved_ckpt}; source prompt: "
+          f"{payload.get('source_prompt', '?')!r}")
+
+    print("<> Loading pipeline ...")
+    pipe = StableDiffusionPipeline.from_single_file(
+        model_path,
+        config="stable-diffusion-v1-5/stable-diffusion-v1-5",
+        safety_checker=None,
+        requires_safety_checker=False,
+        torch_dtype=dtype,
+    ).to(device)
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+        pipe.scheduler.config,
+        use_karras_sigmas=True,
+        algorithm_type="dpmsolver++",
+    )
+
+    tokenizer = pipe.tokenizer
+    text_encoder = pipe.text_encoder
+
+    num_added = tokenizer.add_tokens([placeholder])
+    if num_added == 0:
+        raise SystemExit(
+            f"Token {placeholder!r} already exists in the tokenizer."
+        )
+    text_encoder.resize_token_embeddings(len(tokenizer))
+    placeholder_id = tokenizer.convert_tokens_to_ids(placeholder)
+    embedding_layer = text_encoder.get_input_embeddings()
+    with torch.no_grad():
+        embedding_layer.weight.data[placeholder_id] = learned.to(
+            embedding_layer.weight.dtype
+        ).to(device)
+    print(f"<> Spliced learned vector into row {placeholder_id}.")
+
+    prompt_templates = load_prompts(args.prompts_file)
+    prompts = [t.format(tok=placeholder) for t in prompt_templates]
+    negative_prompt = Path(args.neg_prompt_file).read_text().strip() \
+        if Path(args.neg_prompt_file).exists() else ""
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"<> Rendering {len(prompts)} prompts × {args.n} images ...")
+    for prompt in prompts:
+        print(f"=== {prompt}")
+        for i in range(args.n):
+            seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
+            generator = torch.Generator(device="cpu").manual_seed(seed)
+            image = pipe(
+                prompt,
+                guidance_scale=args.guidance,
+                num_inference_steps=args.steps,
+                num_images_per_prompt=1,
+                negative_prompt=negative_prompt,
+                generator=generator,
+            ).images[0]
+
+            parameters = (
+                f"Include in Image: {prompt}; "
+                f"Exclude from Image: {negative_prompt}; "
+                f"Pseudo-token: {placeholder} (file={args.token_file}); "
+                f"Model: {model_name}; Steps: {args.steps}; "
+                f"Guidance Scale: {args.guidance}; Seed: {seed}; "
+                f"Size: 512x512; Scheduler: DPM-Solver++; "
+                f"Generator: Personas 0.1 + HuggingFace diffusers"
+            )
+            png_meta = PngImagePlugin.PngInfo()
+            png_meta.add_text("Description", parameters)
+            png_meta.add_text("parameters", parameters)
+            png_meta.add_text("Software", "Personas 0.1 + HuggingFace diffusers")
+            png_meta.add_itxt(
+                "XML:com.adobe.xmp",
+                xmp_description_packet(parameters),
+                lang="", tkey="",
+            )
+            stem = placeholder.strip("<>").replace(":", "_")
+            path = out_dir / timestamped_filename(f"{stem}-{seed}")
+            image.save(path, pnginfo=png_meta)
+            print(f"    -> {path}")
+
+
+if __name__ == "__main__":
+    main()
