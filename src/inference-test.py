@@ -14,8 +14,7 @@ from util import timestamped_filename, last_path_component, xmp_description_pack
 EDGE_OF_REALISM_MODEL_PATH = "models/edgeOfRealism_eorV20BakedVAE.safetensors"
 EPIC_REALISM_MODEL_PATH = "models/epicrealism_naturalSinRC1VAE.safetensors"
 EPIC_PHOTOG_MODEL_PATH = "models/epicphotogasm_zUniversal.safetensors"
-
-REALISTIC_VISION_MODEL_PATH = "models/todo/Realistic_Vision_V5_1.safetensors"
+REALISTIC_VISION_MODEL_PATH = "models/Realistic_Vision_V5_1.safetensors"
 
 # pick a model
 #model_path = EDGE_OF_REALISM_MODEL_PATH
@@ -45,7 +44,7 @@ pipe = StableDiffusionPipeline.from_single_file(
     config="stable-diffusion-v1-5/stable-diffusion-v1-5",
     safety_checker=None,
     requires_safety_checker=False,
-    torch_dtype=torch.float32,  # fp16 is flaky on MPS — stick to fp32 initially
+    torch_dtype=torch.float16,  # fp16 is flaky on MPS — stick to fp32 initially
 )
 pipe = pipe.to("mps")
 
