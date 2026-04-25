@@ -44,7 +44,8 @@ pipe = StableDiffusionPipeline.from_single_file(
     config="stable-diffusion-v1-5/stable-diffusion-v1-5",
     safety_checker=None,
     requires_safety_checker=False,
-    torch_dtype=torch.float16,  # fp16 is flaky on MPS — stick to fp32 initially
+    # Claude Code says that fp16 is flaky on MPS — but that may not be the case
+    torch_dtype=torch.float16,
 )
 pipe = pipe.to("mps")
 
