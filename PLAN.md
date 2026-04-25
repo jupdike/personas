@@ -198,7 +198,7 @@ for step in range(num_steps):
 
 # Save the learned row only
 learned = embedding_layer.weight[placeholder_id].detach().cpu()
-torch.save({"token": placeholder, "embedding": learned}, "pref_42.pt")
+torch.save({"token": placeholder, "embedding": learned}, f"{experiment_path}/pref_42.pt")
 ```
 
 ### Gradient masking
