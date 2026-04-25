@@ -14,6 +14,11 @@ from util import timestamped_filename, last_path_component, xmp_description_pack
 EDGE_OF_REALISM_MODEL_PATH = "models/edgeOfRealism_eorV20BakedVAE.safetensors"
 model_name = last_path_component(EDGE_OF_REALISM_MODEL_PATH)
 
+EPIC_PREALISM_MODEL_PATH = "models/epicrealism_naturalSinRC1VAE.safetensors"
+model_name = last_path_component(EPIC_PREALISM_MODEL_PATH)
+
+model_path = EPIC_PREALISM_MODEL_PATH
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--init", help="Path to init image for img2img mode")
 parser.add_argument("--steps", type=int, default=25, help="Number of inference steps")
@@ -29,7 +34,7 @@ def resolve_seed(s: int) -> int:
     return random.randint(1, 2**31 - 1) if s == 0 else s
 
 pipe = StableDiffusionPipeline.from_single_file(
-    EDGE_OF_REALISM_MODEL_PATH,
+    model_path,
     config="stable-diffusion-v1-5/stable-diffusion-v1-5",
     safety_checker=None,
     requires_safety_checker=False,
