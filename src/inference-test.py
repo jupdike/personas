@@ -19,8 +19,8 @@ REALISTIC_VISION_MODEL_PATH = "models/Realistic_Vision_V5_1.safetensors"
 # pick a model
 #model_path = EDGE_OF_REALISM_MODEL_PATH
 #model_path = EPIC_REALISM_MODEL_PATH
-#model_path = EPIC_PHOTOG_MODEL_PATH
-model_path = REALISTIC_VISION_MODEL_PATH
+#model_path = REALISTIC_VISION_MODEL_PATH
+model_path = EPIC_PHOTOG_MODEL_PATH
 # end pick a model
 
 model_name = last_path_component(model_path)

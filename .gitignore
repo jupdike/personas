@@ -4,5 +4,6 @@ models/todo/*.safetensors
 .venv/
 __pycache__/
 output/*
+experiments/*
 test-prompt.txt
 neg-prompt.txt
