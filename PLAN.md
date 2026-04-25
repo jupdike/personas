@@ -53,10 +53,11 @@ The principle: the pseudo-token should make the U-Net produce the same noise pre
 import random
 import torch
 import torch.nn.functional as F
+from models import *
 from diffusers import StableDiffusionPipeline
 
 pipe = StableDiffusionPipeline.from_single_file(
-    "/path/to/realisticVisionV60B1_v51VAE.safetensors",
+    model_path,
     torch_dtype=torch.float32,
 ).to("mps")
 
@@ -87,9 +88,15 @@ embedding_layer.weight.requires_grad_(True)
 
 optimizer = torch.optim.AdamW([embedding_layer.weight], lr=5e-4)
 
-persona = "a woman with green eyes, dark hair, warm skin tone"
+# for example
+#persona = "a woman with green eyes, dark hair, warm skin tone"
+# instead, from disk:
+persona = open(f'{experiment_path}/persona.txt').read().strip()
 
 scene_templates = [
+    "{s}",  # bare template for solo-use rendering
+    
+    # Photography / Lighting
     "portrait of {s}, at the beach, golden hour",
     "portrait of {s}, studio lighting, neutral backdrop",
     "portrait of {s}, soft window light, cafe interior",
@@ -101,8 +108,51 @@ scene_templates = [
     "{s}, natural outdoor lighting",
     "a photo of {s}",
     "portrait of {s}",
-    "{s}",  # bare template for solo-use rendering
-    # ... generate ~30-50 with an LLM
+    "{s}, overcast sky, open field",
+    "{s}, candlelight, dark interior",
+    "{s}, morning mist, countryside",
+    "closeup of {s}, soft bokeh background",
+    "{s}, neon lights, night city",
+    "{s}, harsh midday sun, desert",
+    "{s}, golden hour, rooftop",
+    "{s}, foggy street, shallow depth of field",
+    "{s}, backlit by window, warm tones",
+    
+    # Settings / Context
+    "{s}, library interior, reading",
+    "{s}, coffee shop, busy background",
+    "{s}, mountain trail, overcast",
+    "{s}, snowy landscape, winter clothing",
+    "{s}, poolside, summer afternoon",
+    "{s}, market street, candid shot",
+    "{s}, empty subway car",
+    "{s}, concert crowd, stage lights",
+    "{s}, standing in rain, wet street",
+    "{s}, rooftop garden, dusk",
+
+    # Styled / Artistic
+    "oil painting of {s}, soft brushwork",
+    "watercolor portrait of {s}, loose style",
+    "charcoal sketch of {s}, textured paper",
+    "vintage photograph of {s}, sepia tones",
+    "cinematic still of {s}, anamorphic lens",
+    "editorial photo of {s}, fashion magazine",
+    "film grain photo of {s}, 35mm",
+    "renaissance painting style portrait of {s}",
+    "anime style portrait of {s}",
+    "noir photo of {s}, low key lighting",
+
+    # Pose / Framing
+    "full body shot of {s}, plain background",
+    "side profile of {s}, neutral expression",
+    "overhead angle of {s}, looking up",
+    "{s}, looking over shoulder, outdoor",
+    "{s}, arms crossed, confident pose",
+    "{s}, candid laugh, outdoor setting",
+    "{s}, seated, contemplative expression",
+    "{s}, walking away, motion blur",
+    "extreme closeup of {s}, eyes in focus",
+    "{s}, silhouette against sunset sky",
 ]
 
 num_steps = 2000

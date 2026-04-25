@@ -14,3 +14,5 @@ model_path = EPIC_PHOTOG_MODEL_PATH
 
 model_name = last_path_component(model_path)
 print("<> Using model:", model_name)
+
+experiment_path = f"experiments/{model_name}"
