@@ -7,11 +7,12 @@ from diffusers import (
     StableDiffusionImg2ImgPipeline,
     StableDiffusionPipeline,
 )
-from PIL import Image
+from PIL import Image, PngImagePlugin
 
-from util import timestamped_filename
+from util import timestamped_filename, last_path_component, xmp_description_packet
 
 EDGE_OF_REALISM_MODEL_PATH = "models/edgeOfRealism_eorV20BakedVAE.safetensors"
+model_name = last_path_component(EDGE_OF_REALISM_MODEL_PATH)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--init", help="Path to init image for img2img mode")
@@ -26,7 +27,6 @@ args = parser.parse_args()
 
 def resolve_seed(s: int) -> int:
     return random.randint(1, 2**31 - 1) if s == 0 else s
-
 
 pipe = StableDiffusionPipeline.from_single_file(
     EDGE_OF_REALISM_MODEL_PATH,
@@ -77,6 +77,12 @@ else:
 
 for i in range(args.n):
     seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
+    parameters = f"Include in Image: {prompt}; Exclude from Image: {negative_prompt}; Model: {model_name}; Steps: {args.steps}; Guidance Scale: {args.guidance}; Seed: {seed}; Size: 512x512; Scheduler: DPM-Solver++; ML Compute Unit: MPS; Generator: Personas 0.1 + HuggingFace diffusers"
     generator = torch.Generator(device="cpu").manual_seed(seed)
     image = generate(generator)
-    image.save(f"output/{timestamped_filename(f'{stem}-{seed}')}")
+    png_meta = PngImagePlugin.PngInfo()
+    png_meta.add_text("Description", parameters)
+    png_meta.add_text("parameters", parameters)
+    png_meta.add_text("Software", "Personas 0.1 + HuggingFace diffusers")
+    png_meta.add_itxt("XML:com.adobe.xmp", xmp_description_packet(parameters), lang="", tkey="")
+    image.save(f"output/{timestamped_filename(f'{stem}-{seed}')}", pnginfo=png_meta)
