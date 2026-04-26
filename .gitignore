@@ -5,5 +5,5 @@ models/todo/*.safetensors
 __pycache__/
 output/*
 experiments/*
-test-prompt.txt
+test-*.txt
 neg-prompt.txt
