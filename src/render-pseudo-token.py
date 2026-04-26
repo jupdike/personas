@@ -60,6 +60,19 @@ def parse_args():
                    help="Optional init image path. When set, renders in img2img mode.")
     p.add_argument("--strength", type=float, default=0.6,
                    help="img2img strength: 0.0 = identity, 1.0 = ignore init image")
+    p.add_argument("--token-file-b", default=None,
+                   help="Optional second token file. When set, renders a blend "
+                        "sweep between --token-file (A) and --token-file-b (B).")
+    p.add_argument("--blend-steps", type=int, default=4,
+                   help="Number of intervals in the blend sweep. blend-steps=4 "
+                        "produces 5 images per prompt at alpha = 0, 1/4, 2/4, 3/4, 1.")
+    p.add_argument("--blend-mode", choices=["lerp", "slerp"], default="lerp",
+                   help="lerp: naive (1-a)*A + a*B. slerp: spherical interpolation "
+                        "on direction with linear interpolation of magnitude — useful "
+                        "to test whether direction or magnitude is the load-bearing "
+                        "axis of CLIP's embedding space.")
+    p.add_argument("--blend-tok-name", default="<blend>",
+                   help="Internal placeholder name to register for the blended row(s).")
     return p.parse_args()
 
 
@@ -75,31 +88,88 @@ def load_prompts(path: str | None) -> list[str]:
             if line.strip() and not line.strip().startswith("#")]
 
 
+def load_token_payload(path: str):
+    """Returns (payload, embeddings [N, 768], subtokens [N], user_facing_name)."""
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    placeholder = payload["token"]
+    if "embeddings" in payload:
+        embeddings = payload["embeddings"].float()
+        subtokens = payload["subtokens"]
+    else:
+        embeddings = payload["embedding"].float().unsqueeze(0)
+        subtokens = [placeholder]
+    return payload, embeddings, subtokens, placeholder
+
+
+def slerp(a: torch.Tensor, b: torch.Tensor, alpha: float) -> torch.Tensor:
+    """Per-row slerp on direction; linear interpolation of magnitude. Shapes [N, D]."""
+    norm_a = a.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    norm_b = b.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    ua, ub = a / norm_a, b / norm_b
+    dot = (ua * ub).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
+    theta = torch.arccos(dot)
+    sin_theta = torch.sin(theta)
+    direction = torch.where(
+        sin_theta < 1e-6,
+        (1 - alpha) * ua + alpha * ub,  # near-collinear fallback
+        (torch.sin((1 - alpha) * theta) / sin_theta) * ua
+        + (torch.sin(alpha * theta) / sin_theta) * ub,
+    )
+    magnitude = (1 - alpha) * norm_a + alpha * norm_b
+    return direction * magnitude
+
+
+def blend_embeddings(a: torch.Tensor, b: torch.Tensor,
+                     alpha: float, mode: str) -> torch.Tensor:
+    if mode == "lerp":
+        return (1 - alpha) * a + alpha * b
+    if mode == "slerp":
+        return slerp(a, b, alpha)
+    raise ValueError(f"unknown blend mode: {mode!r}")
+
+
 def main():
     args = parse_args()
     device = "mps"
     dtype = torch.float32 if args.dtype == "fp32" else torch.float16
 
-    payload = torch.load(args.token_file, map_location="cpu", weights_only=False)
-    placeholder = payload["token"]  # user-facing name (e.g. "<pref_003>")
-    if "embeddings" in payload:
-        embeddings = payload["embeddings"].float()  # [N, 768]
-        subtokens = payload["subtokens"]
+    payload_a, emb_a, sub_a, name_a = load_token_payload(args.token_file)
+    blend_mode_on = args.token_file_b is not None
+    if blend_mode_on:
+        payload_b, emb_b, sub_b, name_b = load_token_payload(args.token_file_b)
+        if emb_a.shape != emb_b.shape:
+            raise SystemExit(
+                f"Token shape mismatch: A={tuple(emb_a.shape)} vs "
+                f"B={tuple(emb_b.shape)}. Both files must have the same num_tokens."
+            )
+        # Register a fresh synthetic placeholder for the blended row(s).
+        base = args.blend_tok_name.strip("<>")
+        n_rows = emb_a.shape[0]
+        if n_rows == 1:
+            subtokens = [args.blend_tok_name]
+        else:
+            subtokens = [f"<{base}__{i}>" for i in range(n_rows)]
+        placeholder = args.blend_tok_name
     else:
-        # Legacy single-token format.
-        embeddings = payload["embedding"].float().unsqueeze(0)  # [1, 768]
-        subtokens = [placeholder]
+        payload_b = emb_b = sub_b = name_b = None
+        subtokens = sub_a
+        placeholder = name_a
     placeholder_run = " ".join(subtokens)
 
-    saved_ckpt = payload.get("checkpoint_name")
+    saved_ckpt = payload_a.get("checkpoint_name")
     if saved_ckpt and saved_ckpt != model_name:
         print(f"<> WARNING: token was trained against {saved_ckpt!r} but current "
               f"checkpoint is {model_name!r}. Pseudo-tokens are coupled to U-Net "
               "weights — results may be poor.")
-    row_norms = [f"{embeddings[i].norm().item():.3f}" for i in range(embeddings.shape[0])]
-    print(f"<> Token: {placeholder} (subtokens={subtokens}, ||emb||={row_norms})")
-    print(f"<> Trained against: {saved_ckpt}; source prompt: "
-          f"{payload.get('source_prompt', '?')!r}")
+    row_norms_a = [f"{emb_a[i].norm().item():.3f}" for i in range(emb_a.shape[0])]
+    print(f"<> Token A: {name_a} (||emb||={row_norms_a}, "
+          f"source: {payload_a.get('source_prompt', '?')!r})")
+    if blend_mode_on:
+        row_norms_b = [f"{emb_b[i].norm().item():.3f}" for i in range(emb_b.shape[0])]
+        print(f"<> Token B: {name_b} (||emb||={row_norms_b}, "
+              f"source: {payload_b.get('source_prompt', '?')!r})")
+        print(f"<> Blend mode: {args.blend_mode}, {args.blend_steps + 1} "
+              f"steps, registered as {subtokens}")
 
     print("<> Loading pipeline ...")
     pipe = StableDiffusionPipeline.from_single_file(
@@ -126,11 +196,16 @@ def main():
     text_encoder.resize_token_embeddings(len(tokenizer))
     placeholder_ids = tokenizer.convert_tokens_to_ids(subtokens)
     embedding_layer = text_encoder.get_input_embeddings()
-    with torch.no_grad():
-        embedding_layer.weight.data[placeholder_ids] = embeddings.to(
-            embedding_layer.weight.dtype
-        ).to(device)
-    print(f"<> Spliced {embeddings.shape[0]} learned row(s) into ids {placeholder_ids}.")
+
+    def splice(rows: torch.Tensor) -> None:
+        with torch.no_grad():
+            embedding_layer.weight.data[placeholder_ids] = rows.to(
+                embedding_layer.weight.dtype
+            ).to(device)
+
+    if not blend_mode_on:
+        splice(emb_a)
+        print(f"<> Spliced {emb_a.shape[0]} learned row(s) into ids {placeholder_ids}.")
 
     prompt_templates = load_prompts(args.prompts_file)
     # Templates use {tok} (the user-facing name). Substitute it, then expand the
@@ -176,41 +251,65 @@ def main():
                 generator=generator,
             ).images[0]
 
-    print(f"<> Rendering {len(prompts)} prompts × {args.n} images "
+    if blend_mode_on:
+        alphas = [i / args.blend_steps for i in range(args.blend_steps + 1)]
+        a_stem = Path(args.token_file).stem
+        b_stem = Path(args.token_file_b).stem
+    else:
+        alphas = [None]
+        a_stem = b_stem = None
+
+    print(f"<> Rendering {len(prompts)} prompts × {args.n} images × "
+          f"{len(alphas)} alpha(s) "
           f"({'img2img from ' + args.init if args.init else 'txt2img'}) ...")
     for prompt in prompts:
         print(f"=== {prompt}")
         for i in range(args.n):
             seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
-            generator = torch.Generator(device="cpu").manual_seed(seed)
-            image = generate(generator, prompt)
+            for alpha in alphas:
+                if alpha is not None:
+                    splice(blend_embeddings(emb_a, emb_b, alpha, args.blend_mode))
+                # Reset RNG for each alpha so only the embedding differs.
+                generator = torch.Generator(device="cpu").manual_seed(seed)
+                image = generate(generator, prompt)
 
-            parameters = (
-                f"Include in Image: {prompt}; "
-                f"Exclude from Image: {negative_prompt}; "
-                f"Pseudo-token: {placeholder} (file={args.token_file}); "
-                f"Model: {model_name}; Steps: {args.steps}; "
-                f"Guidance Scale: {args.guidance}; Seed: {seed}; "
-                + (f"Init Image: {args.init}; Strength: {args.strength}; "
-                   if args.init else "")
-                + f"Size: 512x512; Scheduler: DPM-Solver++; "
-                f"Generator: Personas 0.1 + HuggingFace diffusers"
-            )
-            png_meta = PngImagePlugin.PngInfo()
-            png_meta.add_text("Description", parameters)
-            png_meta.add_text("parameters", parameters)
-            png_meta.add_text("Software", "Personas 0.1 + HuggingFace diffusers")
-            png_meta.add_itxt(
-                "XML:com.adobe.xmp",
-                xmp_description_packet(parameters),
-                lang="", tkey="",
-            )
-            stem = placeholder.strip("<>").replace(":", "_")
-            if stem_kind:
-                stem = f"{stem_kind}-{stem}"
-            path = out_dir / timestamped_filename(f"{stem}-{seed}")
-            image.save(path, pnginfo=png_meta)
-            print(f"    -> {path}")
+                token_meta = (
+                    f"Pseudo-token: {placeholder} "
+                    f"(blend {a_stem} -> {b_stem}, mode={args.blend_mode}, "
+                    f"alpha={alpha:.3f}); "
+                    if alpha is not None else
+                    f"Pseudo-token: {placeholder} (file={args.token_file}); "
+                )
+                parameters = (
+                    f"Include in Image: {prompt}; "
+                    f"Exclude from Image: {negative_prompt}; "
+                    + token_meta
+                    + f"Model: {model_name}; Steps: {args.steps}; "
+                    f"Guidance Scale: {args.guidance}; Seed: {seed}; "
+                    + (f"Init Image: {args.init}; Strength: {args.strength}; "
+                       if args.init else "")
+                    + f"Size: 512x512; Scheduler: DPM-Solver++; "
+                    f"Generator: Personas 0.1 + HuggingFace diffusers"
+                )
+                png_meta = PngImagePlugin.PngInfo()
+                png_meta.add_text("Description", parameters)
+                png_meta.add_text("parameters", parameters)
+                png_meta.add_text("Software", "Personas 0.1 + HuggingFace diffusers")
+                png_meta.add_itxt(
+                    "XML:com.adobe.xmp",
+                    xmp_description_packet(parameters),
+                    lang="", tkey="",
+                )
+                if alpha is not None:
+                    stem = f"{a_stem}-{b_stem}-a{int(round(alpha * 100)):03d}"
+                else:
+                    stem = placeholder.strip("<>").replace(":", "_")
+                if stem_kind:
+                    stem = f"{stem_kind}-{stem}"
+                path = out_dir / timestamped_filename(f"{stem}-{seed}")
+                image.save(path, pnginfo=png_meta)
+                tag = f"  α={alpha:.2f}" if alpha is not None else ""
+                print(f"   {tag} -> {path}")
 
 
 if __name__ == "__main__":
