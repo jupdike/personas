@@ -73,14 +73,23 @@ def main():
     dtype = torch.float32 if args.dtype == "fp32" else torch.float16
 
     payload = torch.load(args.token_file, map_location="cpu", weights_only=False)
-    placeholder = payload["token"]
-    learned = payload["embedding"].float()  # [768]
+    placeholder = payload["token"]  # user-facing name (e.g. "<pref_003>")
+    if "embeddings" in payload:
+        embeddings = payload["embeddings"].float()  # [N, 768]
+        subtokens = payload["subtokens"]
+    else:
+        # Legacy single-token format.
+        embeddings = payload["embedding"].float().unsqueeze(0)  # [1, 768]
+        subtokens = [placeholder]
+    placeholder_run = " ".join(subtokens)
+
     saved_ckpt = payload.get("checkpoint_name")
     if saved_ckpt and saved_ckpt != model_name:
         print(f"<> WARNING: token was trained against {saved_ckpt!r} but current "
               f"checkpoint is {model_name!r}. Pseudo-tokens are coupled to U-Net "
               "weights — results may be poor.")
-    print(f"<> Token: {placeholder} (||emb||={learned.norm().item():.3f})")
+    row_norms = [f"{embeddings[i].norm().item():.3f}" for i in range(embeddings.shape[0])]
+    print(f"<> Token: {placeholder} (subtokens={subtokens}, ||emb||={row_norms})")
     print(f"<> Trained against: {saved_ckpt}; source prompt: "
           f"{payload.get('source_prompt', '?')!r}")
 
@@ -101,22 +110,27 @@ def main():
     tokenizer = pipe.tokenizer
     text_encoder = pipe.text_encoder
 
-    num_added = tokenizer.add_tokens([placeholder])
-    if num_added == 0:
+    num_added = tokenizer.add_tokens(subtokens)
+    if num_added != len(subtokens):
         raise SystemExit(
-            f"Token {placeholder!r} already exists in the tokenizer."
+            f"One or more of {subtokens!r} already exist in the tokenizer."
         )
     text_encoder.resize_token_embeddings(len(tokenizer))
-    placeholder_id = tokenizer.convert_tokens_to_ids(placeholder)
+    placeholder_ids = tokenizer.convert_tokens_to_ids(subtokens)
     embedding_layer = text_encoder.get_input_embeddings()
     with torch.no_grad():
-        embedding_layer.weight.data[placeholder_id] = learned.to(
+        embedding_layer.weight.data[placeholder_ids] = embeddings.to(
             embedding_layer.weight.dtype
         ).to(device)
-    print(f"<> Spliced learned vector into row {placeholder_id}.")
+    print(f"<> Spliced {embeddings.shape[0]} learned row(s) into ids {placeholder_ids}.")
 
     prompt_templates = load_prompts(args.prompts_file)
-    prompts = [t.format(tok=placeholder) for t in prompt_templates]
+    # Templates use {tok} (the user-facing name). Substitute it, then expand the
+    # user-facing name to the registered subtoken run before tokenization.
+    prompts = [
+        t.format(tok=placeholder).replace(placeholder, placeholder_run)
+        for t in prompt_templates
+    ]
     negative_prompt = Path(args.neg_prompt_file).read_text().strip() \
         if Path(args.neg_prompt_file).exists() else ""
 

@@ -89,7 +89,13 @@ def file_sha256(path: str) -> str:
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--placeholder", default="<pref_001>",
-                   help="Placeholder token to add to the tokenizer")
+                   help="User-facing placeholder token. With --num-tokens > 1, "
+                        "internal subtokens like <name__0>, <name__1>, ... are "
+                        "registered and the user-facing name expands to that run "
+                        "at training and inference time.")
+    p.add_argument("--num-tokens", type=int, default=1,
+                   help="Number of pseudo-token rows to train. >1 gives the "
+                        "transformer multiple positions to encode the persona.")
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--seed", type=int, default=42)
@@ -131,7 +137,10 @@ def main():
     print(f"<> Persona: {persona}")
     print(f"<> Placeholder: {args.placeholder}")
     print(f"<> Steps: {args.steps}  lr: {args.lr}  dtype: {args.dtype}  "
-          f"init: {args.init_mode}  timestep-bias: {args.timestep_bias}")
+          f"init: {args.init_mode}  timestep-bias: {args.timestep_bias}  "
+          f"num-tokens: {args.num_tokens}")
+    if args.num_tokens < 1:
+        raise SystemExit("--num-tokens must be >= 1")
 
     print("<> Loading pipeline ...")
     pipe = StableDiffusionPipeline.from_single_file(
@@ -149,54 +158,82 @@ def main():
     # We don't need the VAE for distillation training.
     pipe.vae = None
 
-    # Add the placeholder token and resize the embedding table.
-    num_added = tokenizer.add_tokens([args.placeholder])
-    if num_added == 0:
+    # Build the subtoken list. With num_tokens=1 we use the placeholder name itself
+    # as the only registered token (preserves the prior single-token format/UX).
+    if args.num_tokens == 1:
+        subtokens = [args.placeholder]
+    else:
+        base = args.placeholder.strip("<>")
+        subtokens = [f"<{base}__{i}>" for i in range(args.num_tokens)]
+    placeholder_run = " ".join(subtokens)
+
+    # Add the subtokens to the tokenizer and resize the embedding table.
+    num_added = tokenizer.add_tokens(subtokens)
+    if num_added != len(subtokens):
         raise SystemExit(
-            f"Token {args.placeholder!r} already exists in the tokenizer; "
-            "pick a different placeholder."
+            f"One or more of {subtokens!r} already exist in the tokenizer; "
+            "pick a different --placeholder."
         )
     text_encoder.resize_token_embeddings(len(tokenizer))
-    placeholder_id = tokenizer.convert_tokens_to_ids(args.placeholder)
-    print(f"<> Placeholder token id: {placeholder_id} "
-          f"(vocab size now {len(tokenizer)})")
+    placeholder_ids = tokenizer.convert_tokens_to_ids(subtokens)
+    print(f"<> Subtokens: {subtokens} -> ids {placeholder_ids}")
+    print(f"<> Placeholder run substituted into templates: {placeholder_run!r}")
 
     embedding_layer = text_encoder.get_input_embeddings()
     bos_id = tokenizer.bos_token_id
     eos_id = tokenizer.eos_token_id
     pad_id = tokenizer.pad_token_id
+
+    # Build the source pool of token ids to initialize from.
     if args.init_mode == "persona":
-        # Tokenize the persona string and average its content tokens (no specials).
         persona_ids = tokenizer(persona, add_special_tokens=False).input_ids
         persona_ids = [i for i in persona_ids
-                       if i not in (bos_id, eos_id, pad_id, placeholder_id)]
+                       if i not in (bos_id, eos_id, pad_id) and i not in placeholder_ids]
         if not persona_ids:
             raise SystemExit("Persona tokenized to zero content tokens; cannot init.")
-        init_ids = persona_ids
-        init_label = f"persona ({len(init_ids)} tokens)"
+        init_pool = persona_ids
+        init_label = f"persona ({len(init_pool)} tokens)"
     else:
         words = [w.strip() for w in args.init_words.split(",") if w.strip()]
-        init_ids = tokenizer.convert_tokens_to_ids(words)
+        init_pool = tokenizer.convert_tokens_to_ids(words)
         init_label = f"words {words}"
+
+    # Init each row from a different chunk of the init pool (rotating if pool is
+    # smaller than num_tokens). Distinct starting points let the rows specialize.
     with torch.no_grad():
-        init_vec = embedding_layer.weight[init_ids].float().mean(0)
-        embedding_layer.weight[placeholder_id] = init_vec.to(embedding_layer.weight.dtype)
-    print(f"<> Initialized from mean of {init_label} -> norm {init_vec.norm().item():.3f}")
+        for i, pid in enumerate(placeholder_ids):
+            if args.num_tokens == 1:
+                chunk = init_pool
+            else:
+                # Split init_pool into N contiguous chunks; if pool < N, repeat.
+                chunk_size = max(1, len(init_pool) // args.num_tokens)
+                start = (i * chunk_size) % len(init_pool)
+                end = start + chunk_size
+                chunk = init_pool[start:end] if end <= len(init_pool) else (
+                    init_pool[start:] + init_pool[:end - len(init_pool)]
+                )
+            init_vec = embedding_layer.weight[chunk].float().mean(0)
+            embedding_layer.weight[pid] = init_vec.to(embedding_layer.weight.dtype)
+    init_norms = [
+        embedding_layer.weight[pid].float().norm().item() for pid in placeholder_ids
+    ]
+    print(f"<> Initialized from {init_label}; per-row ||emb|| = "
+          f"{[f'{n:.3f}' for n in init_norms]}")
 
     # Freeze everything. The embedding weight needs requires_grad=True so autograd
-    # produces a gradient for our row; we then mask all other rows to zero.
+    # produces a gradient for our rows; we extract only the rows we care about.
     for p in text_encoder.parameters():
         p.requires_grad_(False)
     for p in unet.parameters():
         p.requires_grad_(False)
     embedding_layer.weight.requires_grad_(True)
 
-    # fp32 master copy of just the placeholder row. The frozen pipeline can stay in
-    # fp16 (fast on MPS, low memory), but the optimizer state and weight update must
-    # be in fp32 to avoid NaN from underflow on tiny noise-prediction MSE gradients.
+    # fp32 master copy of the placeholder rows. The frozen pipeline stays in fp16
+    # for speed/memory on MPS; the optimizer step runs in fp32 to avoid NaN from
+    # underflow on tiny noise-prediction MSE gradients.
     master = nn.Parameter(
-        embedding_layer.weight[placeholder_id].detach().float().clone()
-    )
+        embedding_layer.weight[placeholder_ids].detach().float().clone()
+    )  # shape [N, 768]
     optimizer = torch.optim.AdamW([master], lr=args.lr)
 
     num_train_timesteps = pipe.scheduler.config.num_train_timesteps
@@ -206,15 +243,15 @@ def main():
     last_log = t0
     print(f"<> Starting training for {args.steps} steps ...")
     for step in range(args.steps):
-        # Push the current fp32 master row into the (possibly-fp16) embedding table.
+        # Push the current fp32 master rows into the (possibly-fp16) embedding table.
         with torch.no_grad():
-            embedding_layer.weight.data[placeholder_id] = master.data.to(
+            embedding_layer.weight.data[placeholder_ids] = master.data.to(
                 embedding_layer.weight.dtype
             )
 
         template = random.choice(SCENE_TEMPLATES)
         target_prompt = template.format(s=persona)
-        pred_prompt = template.format(s=args.placeholder)
+        pred_prompt = template.format(s=placeholder_run)
 
         target_ids = tokenizer(
             target_prompt, padding="max_length", max_length=77,
@@ -247,11 +284,11 @@ def main():
         master.grad = None
         loss.backward()
 
-        # Pull the gradient for our row out of the (fp16) embedding table, cast to
+        # Pull the gradient for our rows out of the (fp16) embedding table, cast to
         # fp32, and apply the AdamW step on the master copy.
         if embedding_layer.weight.grad is not None:
             master.grad = (
-                embedding_layer.weight.grad[placeholder_id].detach().float().clone()
+                embedding_layer.weight.grad[placeholder_ids].detach().float().clone()
             )
             if not torch.isfinite(master.grad).all():
                 # Skip this step if anything blew up; keep training stable.
@@ -265,17 +302,18 @@ def main():
             now = time.time()
             sps = args.log_every / max(1e-6, now - last_log) if step > 0 else 0.0
             last_log = now
-            norm = master.detach().norm().item()
+            row_norms = [f"{master[i].detach().norm().item():.3f}"
+                         for i in range(args.num_tokens)]
             print(f"step {step:5d}  loss={loss.item():.6f}  avg{args.log_every}={avg:.6f}  "
-                  f"||emb||={norm:.3f}  ({sps:.2f} step/s)")
+                  f"||emb||={row_norms}  ({sps:.2f} step/s)")
 
         if args.save_every and step > 0 and step % args.save_every == 0:
-            save_token(args, persona, master.detach(), step)
+            save_token(args, persona, master.detach(), subtokens, step)
 
     elapsed = time.time() - t0
     print(f"<> Done in {elapsed:.1f}s ({args.steps / elapsed:.2f} step/s)")
 
-    out_path = save_token(args, persona, master.detach(), args.steps)
+    out_path = save_token(args, persona, master.detach(), subtokens, args.steps)
     print(f"<> Saved final pseudo-token to {out_path}")
 
     # Sidecar JSON for human inspection (the .pt itself is the source of truth).
@@ -283,6 +321,8 @@ def main():
     with open(meta_path, "w") as f:
         json.dump({
             "token": args.placeholder,
+            "subtokens": subtokens,
+            "num_tokens": args.num_tokens,
             "checkpoint_name": model_name,
             "checkpoint_path": model_path,
             "source_prompt": persona,
@@ -304,22 +344,28 @@ def main():
     print(f"<> Metadata sidecar at {meta_path}")
 
 
-def save_token(args, persona: str, embedding: torch.Tensor, step: int) -> str:
+def save_token(args, persona: str, embeddings: torch.Tensor,
+               subtokens: list[str], step: int) -> str:
     name = args.placeholder.strip("<>").replace(":", "_").replace("/", "_")
     if args.out:
         out = args.out
     else:
         out = f"{experiment_path}/{name}.pt"
-    learned = embedding.detach().float().cpu().clone()
-    torch.save({
+    learned = embeddings.detach().float().cpu().clone()  # [N, 768]
+    payload = {
         "token": args.placeholder,
-        "embedding": learned,
+        "subtokens": subtokens,
+        "embeddings": learned,
         "checkpoint_hash": file_sha256(model_path),
         "checkpoint_name": model_name,
         "source_prompt": persona,
         "num_steps": step,
         "lr": args.lr,
-    }, out)
+    }
+    # Backward-compat alias for single-token files (older render scripts read this).
+    if learned.shape[0] == 1:
+        payload["embedding"] = learned[0]
+    torch.save(payload, out)
     return out
 
 
