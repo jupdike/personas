@@ -93,9 +93,15 @@ def parse_args():
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--init-mode", choices=["persona", "words"], default="persona",
+                   help="persona: initialize from the mean of the persona's own token "
+                        "embeddings (puts the placeholder in the right region from step "
+                        "0). words: legacy behavior, mean of --init-words.")
     p.add_argument("--init-words", default="woman,portrait,person",
-                   help="Comma-separated words; their input embeddings are averaged "
-                        "to initialize the pseudo-token.")
+                   help="Used only when --init-mode=words.")
+    p.add_argument("--timestep-bias", choices=["uniform", "identity"], default="identity",
+                   help="uniform: sample t over [0, T). identity: 70%% from [300, 900] "
+                        "where text most shapes the image, 30%% from full range.")
     p.add_argument("--log-every", type=int, default=25)
     p.add_argument("--save-every", type=int, default=500,
                    help="Save a checkpoint every N steps (0 to disable)")
@@ -124,7 +130,8 @@ def main():
     print(f"<> Experiment path: {experiment_path}")
     print(f"<> Persona: {persona}")
     print(f"<> Placeholder: {args.placeholder}")
-    print(f"<> Steps: {args.steps}  lr: {args.lr}  dtype: {args.dtype}")
+    print(f"<> Steps: {args.steps}  lr: {args.lr}  dtype: {args.dtype}  "
+          f"init: {args.init_mode}  timestep-bias: {args.timestep_bias}")
 
     print("<> Loading pipeline ...")
     pipe = StableDiffusionPipeline.from_single_file(
@@ -154,13 +161,27 @@ def main():
     print(f"<> Placeholder token id: {placeholder_id} "
           f"(vocab size now {len(tokenizer)})")
 
-    init_words = [w.strip() for w in args.init_words.split(",") if w.strip()]
-    init_ids = tokenizer.convert_tokens_to_ids(init_words)
     embedding_layer = text_encoder.get_input_embeddings()
+    bos_id = tokenizer.bos_token_id
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id
+    if args.init_mode == "persona":
+        # Tokenize the persona string and average its content tokens (no specials).
+        persona_ids = tokenizer(persona, add_special_tokens=False).input_ids
+        persona_ids = [i for i in persona_ids
+                       if i not in (bos_id, eos_id, pad_id, placeholder_id)]
+        if not persona_ids:
+            raise SystemExit("Persona tokenized to zero content tokens; cannot init.")
+        init_ids = persona_ids
+        init_label = f"persona ({len(init_ids)} tokens)"
+    else:
+        words = [w.strip() for w in args.init_words.split(",") if w.strip()]
+        init_ids = tokenizer.convert_tokens_to_ids(words)
+        init_label = f"words {words}"
     with torch.no_grad():
         init_vec = embedding_layer.weight[init_ids].float().mean(0)
         embedding_layer.weight[placeholder_id] = init_vec.to(embedding_layer.weight.dtype)
-    print(f"<> Initialized from mean of {init_words} -> norm {init_vec.norm().item():.3f}")
+    print(f"<> Initialized from mean of {init_label} -> norm {init_vec.norm().item():.3f}")
 
     # Freeze everything. The embedding weight needs requires_grad=True so autograd
     # produces a gradient for our row; we then mask all other rows to zero.
@@ -205,7 +226,11 @@ def main():
         ).input_ids.to(device)
 
         z = torch.randn(1, 4, 64, 64, device=device, dtype=dtype)
-        t = torch.randint(0, num_train_timesteps, (1,), device=device).long()
+        if args.timestep_bias == "identity" and random.random() < 0.7:
+            # Identity-shaping band: text most influences the image around mid-noise.
+            t = torch.randint(300, 900, (1,), device=device).long()
+        else:
+            t = torch.randint(0, num_train_timesteps, (1,), device=device).long()
 
         with torch.no_grad():
             target_hs = text_encoder(target_ids)[0]
@@ -263,7 +288,12 @@ def main():
             "source_prompt": persona,
             "num_steps": args.steps,
             "lr": args.lr,
-            "init_words": init_words,
+            "init_mode": args.init_mode,
+            "init_words": (
+                None if args.init_mode == "persona" else
+                [w.strip() for w in args.init_words.split(",") if w.strip()]
+            ),
+            "timestep_bias": args.timestep_bias,
             "dtype": args.dtype,
             "seed": args.seed,
             "final_loss": losses[-1] if losses else None,
