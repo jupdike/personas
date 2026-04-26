@@ -11,8 +11,12 @@ import random
 from pathlib import Path
 
 import torch
-from diffusers import DPMSolverMultistepScheduler, StableDiffusionPipeline
-from PIL import PngImagePlugin
+from diffusers import (
+    DPMSolverMultistepScheduler,
+    StableDiffusionImg2ImgPipeline,
+    StableDiffusionPipeline,
+)
+from PIL import Image, PngImagePlugin
 
 from models import experiment_path, model_name, model_path
 from util import timestamped_filename, xmp_description_packet
@@ -52,6 +56,10 @@ def parse_args():
     p.add_argument("--out-dir", default="output",
                    help="Directory to save rendered PNGs")
     p.add_argument("--neg-prompt-file", default="neg-prompt.txt")
+    p.add_argument("--init", default=None,
+                   help="Optional init image path. When set, renders in img2img mode.")
+    p.add_argument("--strength", type=float, default=0.6,
+                   help="img2img strength: 0.0 = identity, 1.0 = ignore init image")
     return p.parse_args()
 
 
@@ -137,14 +145,30 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"<> Rendering {len(prompts)} prompts × {args.n} images ...")
-    for prompt in prompts:
-        print(f"=== {prompt}")
-        for i in range(args.n):
-            seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
-            generator = torch.Generator(device="cpu").manual_seed(seed)
-            image = pipe(
-                prompt,
+    if args.init:
+        img2img = StableDiffusionImg2ImgPipeline(
+            **pipe.components,
+            requires_safety_checker=False,
+        )
+        init_image = Image.open(args.init).convert("RGB").resize((512, 512))
+        stem_kind = "i2i"
+
+        def generate(generator, p):
+            return img2img(
+                p,
+                image=init_image,
+                strength=args.strength,
+                guidance_scale=args.guidance,
+                num_inference_steps=args.steps,
+                negative_prompt=negative_prompt,
+                generator=generator,
+            ).images[0]
+    else:
+        stem_kind = None
+
+        def generate(generator, p):
+            return pipe(
+                p,
                 guidance_scale=args.guidance,
                 num_inference_steps=args.steps,
                 num_images_per_prompt=1,
@@ -152,13 +176,24 @@ def main():
                 generator=generator,
             ).images[0]
 
+    print(f"<> Rendering {len(prompts)} prompts × {args.n} images "
+          f"({'img2img from ' + args.init if args.init else 'txt2img'}) ...")
+    for prompt in prompts:
+        print(f"=== {prompt}")
+        for i in range(args.n):
+            seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
+            generator = torch.Generator(device="cpu").manual_seed(seed)
+            image = generate(generator, prompt)
+
             parameters = (
                 f"Include in Image: {prompt}; "
                 f"Exclude from Image: {negative_prompt}; "
                 f"Pseudo-token: {placeholder} (file={args.token_file}); "
                 f"Model: {model_name}; Steps: {args.steps}; "
                 f"Guidance Scale: {args.guidance}; Seed: {seed}; "
-                f"Size: 512x512; Scheduler: DPM-Solver++; "
+                + (f"Init Image: {args.init}; Strength: {args.strength}; "
+                   if args.init else "")
+                + f"Size: 512x512; Scheduler: DPM-Solver++; "
                 f"Generator: Personas 0.1 + HuggingFace diffusers"
             )
             png_meta = PngImagePlugin.PngInfo()
@@ -171,6 +206,8 @@ def main():
                 lang="", tkey="",
             )
             stem = placeholder.strip("<>").replace(":", "_")
+            if stem_kind:
+                stem = f"{stem_kind}-{stem}"
             path = out_dir / timestamped_filename(f"{stem}-{seed}")
             image.save(path, pnginfo=png_meta)
             print(f"    -> {path}")
