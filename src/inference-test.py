@@ -20,6 +20,7 @@ parser.add_argument("--guidance", type=float, default=7.5, help="Classifier-free
 parser.add_argument("--strength", type=float, default=0.6,
                     help="img2img strength: 0.0 = identity, 1.0 = ignore init image")
 parser.add_argument("-n", type=int, default=1, help="Number of images to generate")
+parser.add_argument("--template_file", type=str, help="Wrap prompts with template and init image, split by |||")
 args = parser.parse_args()
 
 def resolve_seed(s: int) -> int:
@@ -44,14 +45,25 @@ pipe.scheduler = DPMSolverMultistepScheduler.from_config(
 prompts = [x.strip() for x in open('test-prompt.txt').read().strip().splitlines() if x.strip() != '' and not x.strip().startswith("#")]
 negative_prompt = open('neg-prompt.txt').read().strip()
 
-if args.init:
+all_pairs = []
+if args.template_file:
+    templates = [x.strip().split("|||") for x in open(args.template_file).readlines() if x.strip() != '' and not x.strip().startswith("#")]
+    for (image, wrapper) in templates:
+        for p in prompts:
+            im = Image.open(image).convert("RGB").resize((512, 512))
+            all_pairs.append((im, wrapper.replace("{s}", p)))
+elif args.init:
+    all_pairs = [(Image.open(args.init).convert("RGB").resize((512, 512)), None)]
+else:
+    all_pairs = [None]
+
+if args.init or all_pairs[0] is not None:
     img2img = StableDiffusionImg2ImgPipeline(
         **pipe.components,
         requires_safety_checker=False,
     )
-    init_image = Image.open(args.init).convert("RGB").resize((512, 512))
     stem = "i2i"
-    def generate(generator, p):
+    def generate(generator, p, init_image):
         return img2img(
             p,
             image=init_image,
@@ -63,7 +75,7 @@ if args.init:
         ).images[0]
 else:
     stem = "out"
-    def generate(generator, p):
+    def generate(generator, p, init_image=None):
         return pipe(
             p,
             guidance_scale=args.guidance,
@@ -73,17 +85,26 @@ else:
             generator=generator,
         ).images[0]
 
+
+print(f"<> Found {len(all_pairs)} prompt pairs (template + prompt).")
 print(f"<> Found {len(prompts)} prompts.")
-for p in prompts:
-    print(f"=== Prompt: {p} ===")
-    for i in range(args.n):
-        seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
-        parameters = f"Include in Image: {p}; Exclude from Image: {negative_prompt}; Model: {model_name}; Steps: {args.steps}; Guidance Scale: {args.guidance}; Seed: {seed}; Size: 512x512; Scheduler: DPM-Solver++; ML Compute Unit: MPS; Generator: Personas 0.1 + HuggingFace diffusers"
-        generator = torch.Generator(device="cpu").manual_seed(seed)
-        image = generate(generator, p)
-        png_meta = PngImagePlugin.PngInfo()
-        png_meta.add_text("Description", parameters)
-        png_meta.add_text("parameters", parameters)
-        png_meta.add_text("Software", "Personas 0.1 + HuggingFace diffusers")
-        png_meta.add_itxt("XML:com.adobe.xmp", xmp_description_packet(parameters), lang="", tkey="")
-        image.save(f"output/{timestamped_filename(f'{stem}-{seed}')}", pnginfo=png_meta)
+for t in all_pairs:
+    image = None
+    if t is not None:
+        print(f"=== Template: {t[1]} ===")
+        image = t[0]
+        if t[1] is not None and t[1].strip() != "":
+            prompts = [t[1]]
+    for p in prompts:
+        print(f"=== Prompt: {p} ===")
+        for i in range(args.n):
+            seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
+            parameters = f"Include in Image: {p}; Exclude from Image: {negative_prompt}; Model: {model_name}; Steps: {args.steps}; Guidance Scale: {args.guidance}; Seed: {seed}; Size: 512x512; Scheduler: DPM-Solver++; ML Compute Unit: MPS; Generator: Personas 0.1 + HuggingFace diffusers"
+            generator = torch.Generator(device="cpu").manual_seed(seed)
+            image = generate(generator, p, image)
+            png_meta = PngImagePlugin.PngInfo()
+            png_meta.add_text("Description", parameters)
+            png_meta.add_text("parameters", parameters)
+            png_meta.add_text("Software", "Personas 0.1 + HuggingFace diffusers")
+            png_meta.add_itxt("XML:com.adobe.xmp", xmp_description_packet(parameters), lang="", tkey="")
+            image.save(f"output/{timestamped_filename(f'{stem}-{seed}')}", pnginfo=png_meta)
