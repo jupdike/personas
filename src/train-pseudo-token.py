@@ -1,21 +1,31 @@
-"""Distill a single source prompt into a 768-dim CLIP pseudo-token.
+"""Train a multi-row CLIP pseudo-token, either by distilling a source prompt
+(--mode distill, default) or by reconstructing reference images
+(--mode images, classical Textual Inversion).
 
-Reads:   {experiment_path}/persona.txt
-Writes:  {experiment_path}/{placeholder}.pt
+distill: reads {experiment_path}/persona.txt as the source prompt and matches
+the U-Net's noise prediction on the placeholder to its prediction on the
+source. No images required.
 
-See PLAN.md for the rationale; this file implements the U-Net prediction
-distillation loop described there.
+images: reads {ref_dir}/*.{png,jpg,jpeg,webp} as identity references and
+trains the placeholder so the U-Net can denoise their VAE latents when
+conditioned on the placeholder. Supervision is real-noise reconstruction at
+random timesteps — the standard TI loss.
+
+Writes: {experiment_path}/{placeholder-stripped}.pt + .json metadata sidecar.
 """
 import argparse
 import hashlib
 import json
 import random
 import time
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers import StableDiffusionPipeline
+from diffusers import DDPMScheduler, StableDiffusionPipeline
+from PIL import Image
+from torchvision import transforms as T
 
 from models import experiment_path, model_name, model_path
 
@@ -78,6 +88,23 @@ SCENE_TEMPLATES = [
 ]
 
 
+# For --mode images: keep the textual context neutral. Scene-specific wrappers
+# would tie identity supervision to scenes that are not in the reference images
+# — exactly the leakage failure mode we're trying to leave behind.
+IMAGE_TEMPLATES = [
+    "{s}",
+    "a photo of {s}",
+    "a portrait of {s}",
+    "a closeup of {s}",
+    "a headshot of {s}",
+    "a portrait photo of {s}",
+    "a photograph of {s}",
+    "a picture of {s}",
+    "a photo of the person {s}",
+    "a portrait of the person {s}",
+]
+
+
 def file_sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -88,6 +115,13 @@ def file_sha256(path: str) -> str:
 
 def parse_args():
     p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["distill", "images"], default="distill",
+                   help="distill: match U-Net noise prediction to the source prompt "
+                        "in persona.txt (no images needed). images: classical TI — "
+                        "reconstruct reference images from --ref-dir.")
+    p.add_argument("--ref-dir", default=None,
+                   help="Directory of reference images for --mode=images. "
+                        "Reads *.png, *.jpg, *.jpeg, *.webp.")
     p.add_argument("--placeholder", default="<pref_001>",
                    help="User-facing placeholder token. With --num-tokens > 1, "
                         "internal subtokens like <name__0>, <name__1>, ... are "
@@ -96,13 +130,14 @@ def parse_args():
     p.add_argument("--num-tokens", type=int, default=1,
                    help="Number of pseudo-token rows to train. >1 gives the "
                         "transformer multiple positions to encode the persona.")
-    p.add_argument("--steps", type=int, default=2000)
+    p.add_argument("--steps", type=int, default=None,
+                   help="Training steps. Defaults: 2000 for distill, 3000 for images.")
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--init-mode", choices=["persona", "words"], default="persona",
+    p.add_argument("--init-mode", choices=["persona", "words"], default=None,
                    help="persona: initialize from the mean of the persona's own token "
-                        "embeddings (puts the placeholder in the right region from step "
-                        "0). words: legacy behavior, mean of --init-words.")
+                        "embeddings. words: mean of --init-words. Defaults: persona "
+                        "for distill mode (when persona.txt exists); words for images.")
     p.add_argument("--init-words", default="woman,portrait,person",
                    help="Used only when --init-mode=words.")
     p.add_argument("--timestep-bias", choices=["uniform", "identity"], default="identity",
@@ -121,8 +156,47 @@ def parse_args():
     return p.parse_args()
 
 
+def preencode_references(ref_dir: str, vae, device: str, dtype: torch.dtype):
+    """Load images, encode them through the VAE to latents [K, 4, 64, 64].
+
+    Returns (latents on device, list of (Path, sha256) tuples).
+    """
+    paths = sorted([
+        p for p in Path(ref_dir).iterdir()
+        if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
+    ])
+    if not paths:
+        raise SystemExit(f"No images found in {ref_dir!r}")
+
+    transform = T.Compose([
+        T.Resize(512, interpolation=T.InterpolationMode.LANCZOS),
+        T.CenterCrop(512),
+        T.ToTensor(),  # -> [3, 512, 512] in [0, 1]
+        T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # -> [-1, 1]
+    ])
+
+    latents = []
+    digests = []
+    with torch.no_grad():
+        for p in paths:
+            img = Image.open(p).convert("RGB")
+            pixel = transform(img).unsqueeze(0).to(device=device, dtype=dtype)
+            lat = vae.encode(pixel).latent_dist.sample()
+            lat = lat * vae.config.scaling_factor  # standard SD 1.5 latent scale
+            latents.append(lat)
+            digests.append((p, file_sha256(str(p))[:16]))
+    return torch.cat(latents, dim=0), digests
+
+
 def main():
     args = parse_args()
+
+    if args.num_tokens < 1:
+        raise SystemExit("--num-tokens must be >= 1")
+    if args.mode == "images" and not args.ref_dir:
+        raise SystemExit("--mode=images requires --ref-dir")
+    if args.steps is None:
+        args.steps = 3000 if args.mode == "images" else 2000
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -130,17 +204,34 @@ def main():
     device = "mps"
     dtype = torch.float32 if args.dtype == "fp32" else torch.float16
 
+    # persona.txt: required for distill mode (it IS the source prompt). Optional
+    # in images mode — kept around for human-readable description and as the
+    # source pool for --init-mode=persona.
     persona_path = f"{experiment_path}/persona.txt"
-    persona = open(persona_path).read().strip()
+    if Path(persona_path).exists():
+        persona = open(persona_path).read().strip()
+    elif args.mode == "distill":
+        raise SystemExit(f"distill mode requires {persona_path}")
+    else:
+        persona = ""
+
+    # Default --init-mode based on training mode and what's available.
+    if args.init_mode is None:
+        if args.mode == "distill":
+            args.init_mode = "persona"
+        else:
+            args.init_mode = "persona" if persona else "words"
+
     print(f"<> Model: {model_name}")
     print(f"<> Experiment path: {experiment_path}")
-    print(f"<> Persona: {persona}")
+    print(f"<> Mode: {args.mode}"
+          + (f"  ref-dir: {args.ref_dir}" if args.mode == "images" else ""))
+    if persona:
+        print(f"<> Persona: {persona}")
     print(f"<> Placeholder: {args.placeholder}")
     print(f"<> Steps: {args.steps}  lr: {args.lr}  dtype: {args.dtype}  "
           f"init: {args.init_mode}  timestep-bias: {args.timestep_bias}  "
           f"num-tokens: {args.num_tokens}")
-    if args.num_tokens < 1:
-        raise SystemExit("--num-tokens must be >= 1")
 
     print("<> Loading pipeline ...")
     pipe = StableDiffusionPipeline.from_single_file(
@@ -155,8 +246,18 @@ def main():
     unet = pipe.unet
     tokenizer = pipe.tokenizer
 
-    # We don't need the VAE for distillation training.
-    pipe.vae = None
+    # In images mode, encode references once with the VAE, then drop it. In
+    # distill mode the VAE is never needed.
+    ref_latents = None
+    ref_digests = None
+    if args.mode == "images":
+        print(f"<> Encoding references in {args.ref_dir} ...")
+        ref_latents, ref_digests = preencode_references(
+            args.ref_dir, pipe.vae, device, dtype
+        )
+        print(f"<> Encoded {ref_latents.shape[0]} reference latents "
+              f"(shape {tuple(ref_latents.shape)})")
+    pipe.vae = None  # free VAE memory once references are cached.
 
     # Build the subtoken list. With num_tokens=1 we use the placeholder name itself
     # as the only registered token (preserves the prior single-token format/UX).
@@ -238,6 +339,16 @@ def main():
 
     num_train_timesteps = pipe.scheduler.config.num_train_timesteps
 
+    # In images mode we need a forward-process scheduler with a clean add_noise.
+    # Build one explicitly so the result doesn't depend on whatever scheduler
+    # the pipeline ships with.
+    train_scheduler = (
+        DDPMScheduler.from_config(pipe.scheduler.config)
+        if args.mode == "images" else None
+    )
+
+    templates = SCENE_TEMPLATES if args.mode == "distill" else IMAGE_TEMPLATES
+
     losses = []
     t0 = time.time()
     last_log = t0
@@ -249,36 +360,46 @@ def main():
                 embedding_layer.weight.dtype
             )
 
-        template = random.choice(SCENE_TEMPLATES)
-        target_prompt = template.format(s=persona)
+        template = random.choice(templates)
         pred_prompt = template.format(s=placeholder_run)
-
-        target_ids = tokenizer(
-            target_prompt, padding="max_length", max_length=77,
-            truncation=True, return_tensors="pt",
-        ).input_ids.to(device)
         pred_ids = tokenizer(
             pred_prompt, padding="max_length", max_length=77,
             truncation=True, return_tensors="pt",
         ).input_ids.to(device)
 
-        z = torch.randn(1, 4, 64, 64, device=device, dtype=dtype)
         if args.timestep_bias == "identity" and random.random() < 0.7:
             # Identity-shaping band: text most influences the image around mid-noise.
             t = torch.randint(300, 900, (1,), device=device).long()
         else:
             t = torch.randint(0, num_train_timesteps, (1,), device=device).long()
 
-        with torch.no_grad():
-            target_hs = text_encoder(target_ids)[0]
-            eps_target = unet(z, t, encoder_hidden_states=target_hs).sample
+        if args.mode == "distill":
+            target_prompt = template.format(s=persona)
+            target_ids = tokenizer(
+                target_prompt, padding="max_length", max_length=77,
+                truncation=True, return_tensors="pt",
+            ).input_ids.to(device)
+            z = torch.randn(1, 4, 64, 64, device=device, dtype=dtype)
+            with torch.no_grad():
+                target_hs = text_encoder(target_ids)[0]
+                eps_target = unet(z, t, encoder_hidden_states=target_hs).sample
+            pred_hs = text_encoder(pred_ids)[0]
+            eps_pred = unet(z, t, encoder_hidden_states=pred_hs).sample
+            target_signal = eps_target
+        else:
+            # Sample one cached reference latent and run the standard latent-
+            # diffusion forward process to build a noisy input.
+            ref_idx = random.randrange(ref_latents.shape[0])
+            ref_lat = ref_latents[ref_idx:ref_idx + 1]  # [1, 4, 64, 64]
+            noise = torch.randn_like(ref_lat)
+            noisy = train_scheduler.add_noise(ref_lat, noise, t)
+            pred_hs = text_encoder(pred_ids)[0]
+            eps_pred = unet(noisy, t, encoder_hidden_states=pred_hs).sample
+            target_signal = noise
 
-        pred_hs = text_encoder(pred_ids)[0]
-        eps_pred = unet(z, t, encoder_hidden_states=pred_hs).sample
-
-        # Compute the loss in fp32 — the noise-prediction MSE is small (~5e-4) and
-        # underflows to zero in fp16, which produced NaNs in earlier runs.
-        loss = F.mse_loss(eps_pred.float(), eps_target.float())
+        # Compute the loss in fp32 — noise-prediction MSE is small enough to
+        # underflow in fp16 (we hit NaNs in earlier runs without this cast).
+        loss = F.mse_loss(eps_pred.float(), target_signal.float())
 
         embedding_layer.weight.grad = None
         master.grad = None
@@ -318,29 +439,35 @@ def main():
 
     # Sidecar JSON for human inspection (the .pt itself is the source of truth).
     meta_path = out_path.replace(".pt", ".json")
+    sidecar = {
+        "mode": args.mode,
+        "token": args.placeholder,
+        "subtokens": subtokens,
+        "num_tokens": args.num_tokens,
+        "checkpoint_name": model_name,
+        "checkpoint_path": model_path,
+        "source_prompt": persona,
+        "num_steps": args.steps,
+        "lr": args.lr,
+        "init_mode": args.init_mode,
+        "init_words": (
+            None if args.init_mode == "persona" else
+            [w.strip() for w in args.init_words.split(",") if w.strip()]
+        ),
+        "timestep_bias": args.timestep_bias,
+        "dtype": args.dtype,
+        "seed": args.seed,
+        "final_loss": losses[-1] if losses else None,
+        "avg_loss_last_100": (
+            sum(losses[-100:]) / max(1, len(losses[-100:])) if losses else None
+        ),
+    }
+    if args.mode == "images":
+        sidecar["ref_dir"] = args.ref_dir
+        sidecar["ref_count"] = len(ref_digests)
+        sidecar["refs"] = [{"path": str(p), "sha256_16": h} for p, h in ref_digests]
     with open(meta_path, "w") as f:
-        json.dump({
-            "token": args.placeholder,
-            "subtokens": subtokens,
-            "num_tokens": args.num_tokens,
-            "checkpoint_name": model_name,
-            "checkpoint_path": model_path,
-            "source_prompt": persona,
-            "num_steps": args.steps,
-            "lr": args.lr,
-            "init_mode": args.init_mode,
-            "init_words": (
-                None if args.init_mode == "persona" else
-                [w.strip() for w in args.init_words.split(",") if w.strip()]
-            ),
-            "timestep_bias": args.timestep_bias,
-            "dtype": args.dtype,
-            "seed": args.seed,
-            "final_loss": losses[-1] if losses else None,
-            "avg_loss_last_100": (
-                sum(losses[-100:]) / max(1, len(losses[-100:])) if losses else None
-            ),
-        }, f, indent=2)
+        json.dump(sidecar, f, indent=2)
     print(f"<> Metadata sidecar at {meta_path}")
 
 
