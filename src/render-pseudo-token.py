@@ -77,6 +77,17 @@ def parse_args():
                    help="Scalar multiplier applied to all rows before splicing. "
                         "Use to attenuate an over-amplified token (try 0.6–0.85) "
                         "without retraining. Default 1.0.")
+    p.add_argument("--cfg-pt", type=float, default=None,
+                   help="Enable split-CFG: --guidance is applied only to the text "
+                        "(prompt with {tok} replaced by --cfg-pt-baseline), and "
+                        "--cfg-pt is the guidance applied to the PT contribution "
+                        "(full − text_only). Try 1.5–3.0 when --guidance=7.5 "
+                        "blows out skin. Costs +1 U-Net pass per step.")
+    p.add_argument("--cfg-pt-baseline", default="",
+                   help="String substituted for {tok} when building the text-only "
+                        "reference prompt for split-CFG. Empty leaves a hole "
+                        "(\"a photo of \"); 'person' or 'woman' produce cleaner "
+                        "fragments. Only used when --cfg-pt is set.")
     return p.parse_args()
 
 
@@ -132,8 +143,62 @@ def blend_embeddings(a: torch.Tensor, b: torch.Tensor,
     raise ValueError(f"unknown blend mode: {mode!r}")
 
 
+@torch.no_grad()
+def encode_text(pipe, text: str, device, dtype):
+    inputs = pipe.tokenizer(
+        text,
+        padding="max_length",
+        max_length=pipe.tokenizer.model_max_length,
+        truncation=True,
+        return_tensors="pt",
+    )
+    return pipe.text_encoder(inputs.input_ids.to(device))[0].to(dtype)
+
+
+@torch.no_grad()
+def split_cfg_generate(pipe, prompt_full, prompt_text, negative_prompt,
+                       guidance_text, guidance_pt, num_steps, generator,
+                       device, dtype, height=512, width=512):
+    """Run denoising with three conditions (uncond/text-only/full) so that the
+    PT contribution can be guided independently from the text contribution.
+
+        pred = uncond + g_text·(text − uncond) + g_pt·(full − text)
+    """
+    emb_neg = encode_text(pipe, negative_prompt, device, dtype)
+    emb_text = encode_text(pipe, prompt_text, device, dtype)
+    emb_full = encode_text(pipe, prompt_full, device, dtype)
+    embeds = torch.cat([emb_neg, emb_text, emb_full], dim=0)
+
+    pipe.scheduler.set_timesteps(num_steps, device=device)
+    timesteps = pipe.scheduler.timesteps
+
+    shape = (1, pipe.unet.config.in_channels, height // 8, width // 8)
+    latents = torch.randn(shape, generator=generator, dtype=dtype).to(device)
+    latents = latents * pipe.scheduler.init_noise_sigma
+
+    for t in timesteps:
+        x_in = torch.cat([latents] * 3)
+        x_in = pipe.scheduler.scale_model_input(x_in, t)
+        noise_pred = pipe.unet(x_in, t, encoder_hidden_states=embeds).sample
+        n_neg, n_text, n_full = noise_pred.chunk(3)
+        noise = (
+            n_neg
+            + guidance_text * (n_text - n_neg)
+            + guidance_pt * (n_full - n_text)
+        )
+        latents = pipe.scheduler.step(noise, t, latents).prev_sample
+
+    latents = latents / pipe.vae.config.scaling_factor
+    image = pipe.vae.decode(latents.to(pipe.vae.dtype)).sample
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = image[0].permute(1, 2, 0).float().cpu().numpy()
+    return Image.fromarray((image * 255).round().astype("uint8"))
+
+
 def main():
     args = parse_args()
+    if args.cfg_pt is not None and args.init:
+        raise SystemExit("--cfg-pt is not yet supported with --init (img2img).")
     device = "mps"
     dtype = torch.float32 if args.dtype == "fp32" else torch.float16
 
@@ -222,6 +287,12 @@ def main():
         t.format(tok=placeholder).replace(placeholder, placeholder_run)
         for t in prompt_templates
     ]
+    if args.cfg_pt is not None:
+        prompts_baseline = [t.format(tok=args.cfg_pt_baseline) for t in prompt_templates]
+        print(f"<> split-CFG enabled: g_text={args.guidance}, g_pt={args.cfg_pt}, "
+              f"baseline={args.cfg_pt_baseline!r}")
+    else:
+        prompts_baseline = [None] * len(prompts)
     negative_prompt = Path(args.neg_prompt_file).read_text().strip() \
         if Path(args.neg_prompt_file).exists() else ""
 
@@ -270,8 +341,10 @@ def main():
     print(f"<> Rendering {len(prompts)} prompts × {args.n} images × "
           f"{len(alphas)} alpha(s) "
           f"({'img2img from ' + args.init if args.init else 'txt2img'}) ...")
-    for prompt in prompts:
+    for prompt, prompt_baseline in zip(prompts, prompts_baseline):
         print(f"=== {prompt}")
+        if prompt_baseline is not None:
+            print(f"    [text-only] {prompt_baseline}")
         for i in range(args.n):
             seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
             for alpha in alphas:
@@ -279,7 +352,14 @@ def main():
                     splice(blend_embeddings(emb_a, emb_b, alpha, args.blend_mode))
                 # Reset RNG for each alpha so only the embedding differs.
                 generator = torch.Generator(device="cpu").manual_seed(seed)
-                image = generate(generator, prompt)
+                if args.cfg_pt is not None:
+                    image = split_cfg_generate(
+                        pipe, prompt, prompt_baseline, negative_prompt,
+                        args.guidance, args.cfg_pt, args.steps, generator,
+                        device, dtype,
+                    )
+                else:
+                    image = generate(generator, prompt)
 
                 scale_meta = (f", scale={args.scale:.3f}" if args.scale != 1.0 else "")
                 token_meta = (
@@ -289,12 +369,19 @@ def main():
                     if alpha is not None else
                     f"Pseudo-token: {placeholder} (file={args.token_file}{scale_meta}); "
                 )
+                guidance_meta = (
+                    f"Guidance Scale: {args.guidance} (text), {args.cfg_pt} (PT vs "
+                    f"baseline={args.cfg_pt_baseline!r}); "
+                    if args.cfg_pt is not None else
+                    f"Guidance Scale: {args.guidance}; "
+                )
                 parameters = (
                     f"Include in Image: {prompt}; "
                     f"Exclude from Image: {negative_prompt}; "
                     + token_meta
                     + f"Model: {model_name}; Steps: {args.steps}; "
-                    f"Guidance Scale: {args.guidance}; Seed: {seed}; "
+                    + guidance_meta
+                    + f"Seed: {seed}; "
                     + (f"Init Image: {args.init}; Strength: {args.strength}; "
                        if args.init else "")
                     + f"Size: 512x512; Scheduler: DPM-Solver++; "
@@ -315,6 +402,8 @@ def main():
                     stem = placeholder.strip("<>").replace(":", "_")
                 if args.scale != 1.0:
                     stem = f"{stem}-s{int(round(args.scale * 100)):03d}"
+                if args.cfg_pt is not None:
+                    stem = f"{stem}-cfgpt{int(round(args.cfg_pt * 10)):03d}"
                 if stem_kind:
                     stem = f"{stem_kind}-{stem}"
                 path = out_dir / timestamped_filename(f"{stem}-{seed}")
