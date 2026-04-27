@@ -10,6 +10,7 @@ import argparse
 import random
 from pathlib import Path
 
+import numpy as np
 import torch
 from diffusers import (
     DPMSolverMultistepScheduler,
@@ -158,11 +159,16 @@ def encode_text(pipe, text: str, device, dtype):
 @torch.no_grad()
 def split_cfg_generate(pipe, prompt_full, prompt_text, negative_prompt,
                        guidance_text, guidance_pt, num_steps, generator,
-                       device, dtype, height=512, width=512):
+                       device, dtype, height=512, width=512,
+                       init_image=None, strength=0.6):
     """Run denoising with three conditions (uncond/text-only/full) so that the
     PT contribution can be guided independently from the text contribution.
 
         pred = uncond + g_text·(text − uncond) + g_pt·(full − text)
+
+    If ``init_image`` is provided, runs in img2img mode: encode init to latent,
+    add noise to a partial timestep determined by ``strength``, denoise from
+    there. ``strength`` ∈ [0, 1]; 0 = preserve init exactly, 1 = ignore init.
     """
     emb_neg = encode_text(pipe, negative_prompt, device, dtype)
     emb_text = encode_text(pipe, prompt_text, device, dtype)
@@ -172,9 +178,30 @@ def split_cfg_generate(pipe, prompt_full, prompt_text, negative_prompt,
     pipe.scheduler.set_timesteps(num_steps, device=device)
     timesteps = pipe.scheduler.timesteps
 
-    shape = (1, pipe.unet.config.in_channels, height // 8, width // 8)
-    latents = torch.randn(shape, generator=generator, dtype=dtype).to(device)
-    latents = latents * pipe.scheduler.init_noise_sigma
+    if init_image is not None:
+        img = init_image.convert("RGB").resize((width, height))
+        arr = np.array(img).astype(np.float32) / 255.0
+        arr = arr * 2.0 - 1.0
+        tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(
+            device, dtype=pipe.vae.dtype
+        )
+        init_latents = pipe.vae.encode(tensor).latent_dist.sample(generator)
+        init_latents = (init_latents * pipe.vae.config.scaling_factor).to(dtype)
+
+        # Slice the schedule per diffusers img2img: skip the early (high-noise)
+        # steps so we start near the init-image's signal level.
+        init_timestep = min(int(num_steps * strength), num_steps)
+        t_start = max(num_steps - init_timestep, 0)
+        timesteps = pipe.scheduler.timesteps[t_start * pipe.scheduler.order:]
+
+        noise = torch.randn(
+            init_latents.shape, generator=generator, dtype=dtype
+        ).to(device)
+        latents = pipe.scheduler.add_noise(init_latents, noise, timesteps[:1])
+    else:
+        shape = (1, pipe.unet.config.in_channels, height // 8, width // 8)
+        latents = torch.randn(shape, generator=generator, dtype=dtype).to(device)
+        latents = latents * pipe.scheduler.init_noise_sigma
 
     for t in timesteps:
         x_in = torch.cat([latents] * 3)
@@ -197,8 +224,6 @@ def split_cfg_generate(pipe, prompt_full, prompt_text, negative_prompt,
 
 def main():
     args = parse_args()
-    if args.cfg_pt is not None and args.init:
-        raise SystemExit("--cfg-pt is not yet supported with --init (img2img).")
     device = "mps"
     dtype = torch.float32 if args.dtype == "fp32" else torch.float16
 
@@ -357,6 +382,8 @@ def main():
                         pipe, prompt, prompt_baseline, negative_prompt,
                         args.guidance, args.cfg_pt, args.steps, generator,
                         device, dtype,
+                        init_image=(init_image if args.init else None),
+                        strength=args.strength,
                     )
                 else:
                     image = generate(generator, prompt)
