@@ -56,7 +56,7 @@ def parse_args():
     p.add_argument("--dtype", choices=["fp32", "fp16"], default="fp16")
     p.add_argument("--out-dir", default="output",
                    help="Directory to save rendered PNGs")
-    p.add_argument("--neg-prompt-file", default="neg-prompt.txt")
+    p.add_argument("--neg-prompt-file", default="prompts/neg-prompt.txt")
     p.add_argument("--init", default=None,
                    help="Optional init image path. When set, renders in img2img mode.")
     p.add_argument("--strength", type=float, default=0.6,
