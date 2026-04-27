@@ -275,7 +275,9 @@ def main():
             f"One or more of {subtokens!r} already exist in the tokenizer; "
             "pick a different --placeholder."
         )
-    text_encoder.resize_token_embeddings(len(tokenizer))
+    # mean_resizing=False — we overwrite the new rows anyway, so the multivariate-
+    # normal init is wasted work and just emits a warning.
+    text_encoder.resize_token_embeddings(len(tokenizer), mean_resizing=False)
     placeholder_ids = tokenizer.convert_tokens_to_ids(subtokens)
     print(f"<> Subtokens: {subtokens} -> ids {placeholder_ids}")
     print(f"<> Placeholder run substituted into templates: {placeholder_run!r}")

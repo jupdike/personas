@@ -73,6 +73,10 @@ def parse_args():
                         "axis of CLIP's embedding space.")
     p.add_argument("--blend-tok-name", default="<blend>",
                    help="Internal placeholder name to register for the blended row(s).")
+    p.add_argument("--scale", type=float, default=1.0,
+                   help="Scalar multiplier applied to all rows before splicing. "
+                        "Use to attenuate an over-amplified token (try 0.6–0.85) "
+                        "without retraining. Default 1.0.")
     return p.parse_args()
 
 
@@ -193,11 +197,15 @@ def main():
         raise SystemExit(
             f"One or more of {subtokens!r} already exist in the tokenizer."
         )
-    text_encoder.resize_token_embeddings(len(tokenizer))
+    # mean_resizing=False — we overwrite the new rows anyway, so the multivariate-
+    # normal init is wasted work and just emits a warning.
+    text_encoder.resize_token_embeddings(len(tokenizer), mean_resizing=False)
     placeholder_ids = tokenizer.convert_tokens_to_ids(subtokens)
     embedding_layer = text_encoder.get_input_embeddings()
 
     def splice(rows: torch.Tensor) -> None:
+        if args.scale != 1.0:
+            rows = rows * args.scale
         with torch.no_grad():
             embedding_layer.weight.data[placeholder_ids] = rows.to(
                 embedding_layer.weight.dtype
@@ -273,12 +281,13 @@ def main():
                 generator = torch.Generator(device="cpu").manual_seed(seed)
                 image = generate(generator, prompt)
 
+                scale_meta = (f", scale={args.scale:.3f}" if args.scale != 1.0 else "")
                 token_meta = (
                     f"Pseudo-token: {placeholder} "
                     f"(blend {a_stem} -> {b_stem}, mode={args.blend_mode}, "
-                    f"alpha={alpha:.3f}); "
+                    f"alpha={alpha:.3f}{scale_meta}); "
                     if alpha is not None else
-                    f"Pseudo-token: {placeholder} (file={args.token_file}); "
+                    f"Pseudo-token: {placeholder} (file={args.token_file}{scale_meta}); "
                 )
                 parameters = (
                     f"Include in Image: {prompt}; "
@@ -304,6 +313,8 @@ def main():
                     stem = f"{a_stem}-{b_stem}-a{int(round(alpha * 100)):03d}"
                 else:
                     stem = placeholder.strip("<>").replace(":", "_")
+                if args.scale != 1.0:
+                    stem = f"{stem}-s{int(round(args.scale * 100)):03d}"
                 if stem_kind:
                     stem = f"{stem_kind}-{stem}"
                 path = out_dir / timestamped_filename(f"{stem}-{seed}")
