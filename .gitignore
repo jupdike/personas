@@ -8,3 +8,4 @@ experiments/*
 test-*.txt
 neg-prompt.txt
 templates.txt
+papers/*
