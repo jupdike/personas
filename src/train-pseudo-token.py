@@ -143,6 +143,12 @@ def parse_args():
     p.add_argument("--timestep-bias", choices=["uniform", "identity"], default="identity",
                    help="uniform: sample t over [0, T). identity: 70%% from [300, 900] "
                         "where text most shapes the image, 30%% from full range.")
+    p.add_argument("--cfg-aware", type=float, default=0.0,
+                   help="Images mode only. If > 0, train against the CFG-amplified "
+                        "prediction at this guidance scale (e.g. 7.5) so the token "
+                        "behaves correctly at that CFG without runaway stylization. "
+                        "Costs ~1.7x wall-clock per step (extra unconditional U-Net "
+                        "pass). 0.0 disables. Recommended: 7.5.")
     p.add_argument("--log-every", type=int, default=25)
     p.add_argument("--save-every", type=int, default=500,
                    help="Save a checkpoint every N steps (0 to disable)")
@@ -195,6 +201,8 @@ def main():
         raise SystemExit("--num-tokens must be >= 1")
     if args.mode == "images" and not args.ref_dir:
         raise SystemExit("--mode=images requires --ref-dir")
+    if args.cfg_aware > 0 and args.mode != "images":
+        raise SystemExit("--cfg-aware is only valid in --mode=images")
     if args.steps is None:
         args.steps = 3000 if args.mode == "images" else 2000
 
@@ -231,7 +239,8 @@ def main():
     print(f"<> Placeholder: {args.placeholder}")
     print(f"<> Steps: {args.steps}  lr: {args.lr}  dtype: {args.dtype}  "
           f"init: {args.init_mode}  timestep-bias: {args.timestep_bias}  "
-          f"num-tokens: {args.num_tokens}")
+          f"num-tokens: {args.num_tokens}"
+          + (f"  cfg-aware: {args.cfg_aware}" if args.cfg_aware > 0 else ""))
 
     print("<> Loading pipeline ...")
     pipe = StableDiffusionPipeline.from_single_file(
@@ -351,6 +360,18 @@ def main():
 
     templates = SCENE_TEMPLATES if args.mode == "distill" else IMAGE_TEMPLATES
 
+    # CFG-aware training: cache the unconditional ("") hidden states once. The
+    # empty prompt doesn't reference the placeholder rows, so its text-encoder
+    # output is constant across training steps and we save one forward per step.
+    uncond_hs = None
+    if args.cfg_aware > 0:
+        with torch.no_grad():
+            uncond_ids = tokenizer(
+                "", padding="max_length", max_length=77,
+                truncation=True, return_tensors="pt",
+            ).input_ids.to(device)
+            uncond_hs = text_encoder(uncond_ids)[0]
+
     losses = []
     t0 = time.time()
     last_log = t0
@@ -397,6 +418,16 @@ def main():
             noisy = train_scheduler.add_noise(ref_lat, noise, t)
             pred_hs = text_encoder(pred_ids)[0]
             eps_pred = unet(noisy, t, encoder_hidden_states=pred_hs).sample
+            if args.cfg_aware > 0:
+                # Build the CFG-amplified prediction and match real noise. Forces
+                # the placeholder direction to behave correctly *under guidance*
+                # rather than letting the optimizer take a stylized-direction
+                # shortcut that explodes when amplified at inference.
+                with torch.no_grad():
+                    eps_uncond = unet(
+                        noisy, t, encoder_hidden_states=uncond_hs,
+                    ).sample
+                eps_pred = eps_uncond + args.cfg_aware * (eps_pred - eps_uncond)
             target_signal = noise
 
         # Compute the loss in fp32 — noise-prediction MSE is small enough to
@@ -457,6 +488,7 @@ def main():
             [w.strip() for w in args.init_words.split(",") if w.strip()]
         ),
         "timestep_bias": args.timestep_bias,
+        "cfg_aware": args.cfg_aware,
         "dtype": args.dtype,
         "seed": args.seed,
         "final_loss": losses[-1] if losses else None,
