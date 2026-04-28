@@ -32,9 +32,15 @@
 #         --seed 12345 -n 2
 # done
 
+# uv run python src/render-pseudo-token.py \
+#     --token-file experiments/epicphotogasm_zUniversal/pref_007.pt \
+#     --prompts-file prompts/test-pt.txt \
+#     --init output/face-crop-IMG_0013.png --strength 0.75 \
+#     --guidance 7.5 --cfg-pt 2.2 --cfg-pt-baseline "woman" \
+#     --seed 12345 -n 2
+
+# built-in prompts
 uv run python src/render-pseudo-token.py \
-    --token-file experiments/epicphotogasm_zUniversal/pref_005.pt \
-    --prompts-file prompts/test-pt.txt \
-    --init output/face-crop-IMG_0014.png --strength 0.45 \
+    --token-file experiments/epicphotogasm_zUniversal/pref_007.pt \
     --guidance 7.5 --cfg-pt 2.2 --cfg-pt-baseline "woman" \
     --seed 12345 -n 2

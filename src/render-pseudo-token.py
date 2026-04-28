@@ -203,7 +203,7 @@ def split_cfg_generate(pipe, prompt_full, prompt_text, negative_prompt,
         latents = torch.randn(shape, generator=generator, dtype=dtype).to(device)
         latents = latents * pipe.scheduler.init_noise_sigma
 
-    for t in timesteps:
+    for t in pipe.progress_bar(timesteps):
         x_in = torch.cat([latents] * 3)
         x_in = pipe.scheduler.scale_model_input(x_in, t)
         noise_pred = pipe.unet(x_in, t, encoder_hidden_states=embeds).sample
