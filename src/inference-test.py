@@ -42,8 +42,8 @@ pipe.scheduler = DPMSolverMultistepScheduler.from_config(
     algorithm_type="dpmsolver++",
 )
 
-prompts = [x.strip() for x in open('test-prompt.txt').read().strip().splitlines() if x.strip() != '' and not x.strip().startswith("#")]
-negative_prompt = open('neg-prompt.txt').read().strip()
+prompts = [x.strip() for x in open('prompts/test-prompt.txt').read().strip().splitlines() if x.strip() != '' and not x.strip().startswith("#")]
+negative_prompt = open('prompts/neg-prompt.txt').read().strip()
 
 all_pairs = []
 if args.template_file:
