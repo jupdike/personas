@@ -2,7 +2,7 @@
 set -euo pipefail
 BASE_DIR=experiments/epicphotogasm_zUniversal/persona_05_06
 
-mkdir -p output
+mkdir -p "${BASE_DIR}/masked"
 
 for ref in "${BASE_DIR}/refs/"*.png; do
   STEM=$(basename "$ref" .png)
@@ -15,5 +15,5 @@ for ref in "${BASE_DIR}/refs/"*.png; do
   uv run python src/parse-face-parse.py \
     "$ref" \
     "$MASK" \
-    "output/masked-${STEM}.png"
+    "${BASE_DIR}/masked/${STEM}.png"
 done
