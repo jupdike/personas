@@ -1,8 +1,11 @@
 #!/bin/bash
 set -euo pipefail
-BASE_DIR=experiments/epicphotogasm_zUniversal/persona_05_06
+BASE_DIR=experiments/epicphotogasm_zUniversal/persona_008
+ROOT_DIR=~/Documents/dev/jfu/personas
 
 mkdir -p "${BASE_DIR}/masked"
+# resnet34/ will be added by face-parsing/inference.py, for output folder
+face-parse.sh --input "${ROOT_DIR}/${BASE_DIR}/refs" --output "${ROOT_DIR}/${BASE_DIR}"
 
 for ref in "${BASE_DIR}/refs/"*.png; do
   STEM=$(basename "$ref" .png)
