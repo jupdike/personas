@@ -1,6 +1,6 @@
 """Train a multi-row CLIP pseudo-token, either by distilling a source prompt
 (--mode distill, default) or by reconstructing reference images
-(--mode images, classical Textual Inversion).
+(--mode images / --mode masked-images, classical Textual Inversion).
 
 distill: reads {experiment_path}/persona.txt as the source prompt and matches
 the U-Net's noise prediction on the placeholder to its prediction on the
@@ -10,6 +10,14 @@ images: reads {ref_dir}/*.{png,jpg,jpeg,webp} as identity references and
 trains the placeholder so the U-Net can denoise their VAE latents when
 conditioned on the placeholder. Supervision is real-noise reconstruction at
 random timesteps — the standard TI loss.
+
+masked-images: same as images, but the references are RGBA PNGs whose alpha
+channel marks pixels that count toward the loss (alpha=1 → keep, alpha=0 →
+ignore). The RGB content is encoded as-is (alpha-zero regions still need to
+contain real pixels — the VAE has to encode something). The alpha channel is
+downsampled bilinearly to the 64×64 latent grid and used as a per-pixel
+weight on the noise-prediction MSE, so gradient flows back to the embedding
+only from face/identity pixels and not from background/clothing.
 
 Writes: {experiment_path}/{placeholder-stripped}.pt + .json metadata sidecar.
 """
@@ -115,13 +123,18 @@ def file_sha256(path: str) -> str:
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["distill", "images"], default="distill",
+    p.add_argument("--mode", choices=["distill", "images", "masked-images"],
+                   default="distill",
                    help="distill: match U-Net noise prediction to the source prompt "
                         "in persona.txt (no images needed). images: classical TI — "
-                        "reconstruct reference images from --ref-dir.")
+                        "reconstruct reference images from --ref-dir. masked-images: "
+                        "TI with a per-pixel loss mask read from the RGBA alpha "
+                        "channel (face-parse output) — gradient is gated to identity "
+                        "regions only.")
     p.add_argument("--ref-dir", default=None,
-                   help="Directory of reference images for --mode=images. "
-                        "Reads *.png, *.jpg, *.jpeg, *.webp.")
+                   help="Directory of reference images for --mode=images / "
+                        "--mode=masked-images. Reads *.png, *.jpg, *.jpeg, *.webp. "
+                        "For masked-images, files must be RGBA PNGs.")
     p.add_argument("--placeholder", default="<pref_001>",
                    help="User-facing placeholder token. With --num-tokens > 1, "
                         "internal subtokens like <name__0>, <name__1>, ... are "
@@ -162,10 +175,15 @@ def parse_args():
     return p.parse_args()
 
 
-def preencode_references(ref_dir: str, vae, device: str, dtype: torch.dtype):
+def preencode_references(ref_dir: str, vae, device: str, dtype: torch.dtype,
+                         masked: bool = False):
     """Load images, encode them through the VAE to latents [K, 4, 64, 64].
 
-    Returns (latents on device, list of (Path, sha256) tuples).
+    If ``masked`` is True, also load each image's alpha channel and downsample
+    to a 64×64 latent-resolution per-pixel loss weight tensor [K, 1, 64, 64].
+
+    Returns (latents, masks_or_None, list of (Path, sha256) tuples). Skips with
+    a warning any reference whose mask is empty after downsampling.
     """
     paths = sorted([
         p for p in Path(ref_dir).iterdir()
@@ -174,24 +192,66 @@ def preencode_references(ref_dir: str, vae, device: str, dtype: torch.dtype):
     if not paths:
         raise SystemExit(f"No images found in {ref_dir!r}")
 
-    transform = T.Compose([
+    # Geometric ops are applied to the whole RGBA image so RGB and alpha stay
+    # pixel-aligned; channel-specific normalization happens after.
+    geometric = T.Compose([
         T.Resize(512, interpolation=T.InterpolationMode.LANCZOS),
         T.CenterCrop(512),
+    ])
+    rgb_to_tensor = T.Compose([
         T.ToTensor(),  # -> [3, 512, 512] in [0, 1]
         T.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # -> [-1, 1]
     ])
+    alpha_to_tensor = T.ToTensor()  # PIL "L" -> [1, 512, 512] in [0, 1]
 
     latents = []
+    masks = []
     digests = []
+    skipped = 0
     with torch.no_grad():
         for p in paths:
-            img = Image.open(p).convert("RGB")
-            pixel = transform(img).unsqueeze(0).to(device=device, dtype=dtype)
+            img = Image.open(p)
+            if masked and img.mode != "RGBA":
+                raise SystemExit(
+                    f"--mode=masked-images expects RGBA PNGs, but {p} is mode "
+                    f"{img.mode!r}. Run parse-face-parse.py to produce RGBA inputs."
+                )
+            img = geometric(img)
+            rgb_pil = img.convert("RGB")
+            pixel = rgb_to_tensor(rgb_pil).unsqueeze(0).to(
+                device=device, dtype=dtype,
+            )
             lat = vae.encode(pixel).latent_dist.sample()
             lat = lat * vae.config.scaling_factor  # standard SD 1.5 latent scale
+
+            if masked:
+                # PIL split returns one Image per channel; alpha is the last band.
+                alpha_pil = img.split()[-1]
+                alpha = alpha_to_tensor(alpha_pil).unsqueeze(0)  # [1, 1, 512, 512]
+                mask_lat = F.interpolate(
+                    alpha, size=(64, 64), mode="bilinear", align_corners=False,
+                ).clamp(0.0, 1.0).to(device=device, dtype=dtype)
+                if mask_lat.float().sum().item() < 1.0:
+                    print(f"<> WARN: skipping {p.name}: mask is empty after "
+                          "downsample to latent resolution.")
+                    skipped += 1
+                    continue
+                masks.append(mask_lat)
+
             latents.append(lat)
             digests.append((p, file_sha256(str(p))[:16]))
-    return torch.cat(latents, dim=0), digests
+
+    if not latents:
+        raise SystemExit(
+            f"No usable references in {ref_dir!r} after loading "
+            f"(skipped {skipped})"
+        )
+    if skipped:
+        print(f"<> Skipped {skipped} reference(s) with empty masks.")
+
+    out_latents = torch.cat(latents, dim=0)
+    out_masks = torch.cat(masks, dim=0) if masked else None
+    return out_latents, out_masks, digests
 
 
 def main():
@@ -199,12 +259,13 @@ def main():
 
     if args.num_tokens < 1:
         raise SystemExit("--num-tokens must be >= 1")
-    if args.mode == "images" and not args.ref_dir:
-        raise SystemExit("--mode=images requires --ref-dir")
-    if args.cfg_aware > 0 and args.mode != "images":
-        raise SystemExit("--cfg-aware is only valid in --mode=images")
+    image_modes = ("images", "masked-images")
+    if args.mode in image_modes and not args.ref_dir:
+        raise SystemExit(f"--mode={args.mode} requires --ref-dir")
+    if args.cfg_aware > 0 and args.mode not in image_modes:
+        raise SystemExit("--cfg-aware is only valid in --mode=images / masked-images")
     if args.steps is None:
-        args.steps = 3000 if args.mode == "images" else 2000
+        args.steps = 3000 if args.mode in image_modes else 2000
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -233,7 +294,8 @@ def main():
     print(f"<> Model: {model_name}")
     print(f"<> Experiment path: {experiment_path}")
     print(f"<> Mode: {args.mode}"
-          + (f"  ref-dir: {args.ref_dir}" if args.mode == "images" else ""))
+          + (f"  ref-dir: {args.ref_dir}"
+             if args.mode in ("images", "masked-images") else ""))
     if persona:
         print(f"<> Persona: {persona}")
     print(f"<> Placeholder: {args.placeholder}")
@@ -255,17 +317,24 @@ def main():
     unet = pipe.unet
     tokenizer = pipe.tokenizer
 
-    # In images mode, encode references once with the VAE, then drop it. In
-    # distill mode the VAE is never needed.
+    # In (masked-)images mode, encode references once with the VAE, then drop
+    # it. In distill mode the VAE is never needed.
     ref_latents = None
+    ref_masks = None
     ref_digests = None
-    if args.mode == "images":
+    if args.mode in ("images", "masked-images"):
         print(f"<> Encoding references in {args.ref_dir} ...")
-        ref_latents, ref_digests = preencode_references(
-            args.ref_dir, pipe.vae, device, dtype
+        ref_latents, ref_masks, ref_digests = preencode_references(
+            args.ref_dir, pipe.vae, device, dtype,
+            masked=(args.mode == "masked-images"),
         )
         print(f"<> Encoded {ref_latents.shape[0]} reference latents "
               f"(shape {tuple(ref_latents.shape)})")
+        if ref_masks is not None:
+            cov = ref_masks.float().mean(dim=(1, 2, 3))
+            print(f"<> Mask coverage on latent grid: "
+                  f"min={cov.min().item():.3f} mean={cov.mean().item():.3f} "
+                  f"max={cov.max().item():.3f}")
     pipe.vae = None  # free VAE memory once references are cached.
 
     # Build the subtoken list. With num_tokens=1 we use the placeholder name itself
@@ -355,7 +424,7 @@ def main():
     # the pipeline ships with.
     train_scheduler = (
         DDPMScheduler.from_config(pipe.scheduler.config)
-        if args.mode == "images" else None
+        if args.mode in ("images", "masked-images") else None
     )
 
     templates = SCENE_TEMPLATES if args.mode == "distill" else IMAGE_TEMPLATES
@@ -396,6 +465,7 @@ def main():
         else:
             t = torch.randint(0, num_train_timesteps, (1,), device=device).long()
 
+        mask_lat = None
         if args.mode == "distill":
             target_prompt = template.format(s=persona)
             target_ids = tokenizer(
@@ -429,10 +499,22 @@ def main():
                     ).sample
                 eps_pred = eps_uncond + args.cfg_aware * (eps_pred - eps_uncond)
             target_signal = noise
+            if ref_masks is not None:
+                mask_lat = ref_masks[ref_idx:ref_idx + 1]  # [1, 1, 64, 64]
 
         # Compute the loss in fp32 — noise-prediction MSE is small enough to
         # underflow in fp16 (we hit NaNs in earlier runs without this cast).
-        loss = F.mse_loss(eps_pred.float(), target_signal.float())
+        if mask_lat is not None:
+            # Mask-area-normalized weighted MSE: every reference contributes
+            # equal expected gradient regardless of how much of the frame is
+            # face. Numerator sums over all 4 latent channels and 64×64 cells;
+            # denominator counts the same number of contributing scalars
+            # (4 × Σmask) so the loss magnitude stays comparable to plain MSE.
+            diff = (eps_pred.float() - target_signal.float()) ** 2
+            m = mask_lat.float()
+            loss = (diff * m).sum() / (diff.shape[1] * m.sum().clamp(min=1.0))
+        else:
+            loss = F.mse_loss(eps_pred.float(), target_signal.float())
 
         embedding_layer.weight.grad = None
         master.grad = None
@@ -496,10 +578,17 @@ def main():
             sum(losses[-100:]) / max(1, len(losses[-100:])) if losses else None
         ),
     }
-    if args.mode == "images":
+    if args.mode in ("images", "masked-images"):
         sidecar["ref_dir"] = args.ref_dir
         sidecar["ref_count"] = len(ref_digests)
         sidecar["refs"] = [{"path": str(p), "sha256_16": h} for p, h in ref_digests]
+        if ref_masks is not None:
+            cov = ref_masks.float().mean(dim=(1, 2, 3))
+            sidecar["mask_coverage"] = {
+                "min": float(cov.min().item()),
+                "mean": float(cov.mean().item()),
+                "max": float(cov.max().item()),
+            }
     with open(meta_path, "w") as f:
         json.dump(sidecar, f, indent=2)
     print(f"<> Metadata sidecar at {meta_path}")
