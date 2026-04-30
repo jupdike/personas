@@ -172,6 +172,11 @@ def parse_args():
     p.add_argument("--out", default=None,
                    help="Override output path. Defaults to "
                         "{experiment_path}/{placeholder-stripped}.pt")
+    p.add_argument("--persona-file", default=None,
+                   help="Path to persona.txt. Default for images / masked-images "
+                        "modes: {parent of --ref-dir}/persona.txt, falling back to "
+                        "{experiment_path}/persona.txt. Default for distill mode: "
+                        "{experiment_path}/persona.txt.")
     return p.parse_args()
 
 
@@ -276,9 +281,20 @@ def main():
     # persona.txt: required for distill mode (it IS the source prompt). Optional
     # in images mode — kept around for human-readable description and as the
     # source pool for --init-mode=persona.
-    persona_path = f"{experiment_path}/persona.txt"
+    #
+    # Resolution order:
+    #   1. --persona-file if given.
+    #   2. {parent of --ref-dir}/persona.txt if it exists (per-persona folders).
+    #   3. {experiment_path}/persona.txt (model-root fallback).
+    if args.persona_file is not None:
+        persona_path = args.persona_file
+    elif args.ref_dir is not None and (Path(args.ref_dir).parent / "persona.txt").exists():
+        persona_path = str(Path(args.ref_dir).parent / "persona.txt")
+    else:
+        persona_path = f"{experiment_path}/persona.txt"
     if Path(persona_path).exists():
         persona = open(persona_path).read().strip()
+        print(f"<> persona.txt: {persona_path}")
     elif args.mode == "distill":
         raise SystemExit(f"distill mode requires {persona_path}")
     else:
