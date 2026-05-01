@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-BASE_DIR=experiments/epicphotogasm_zUniversal/persona_008
+BASE_DIR=experiments/epicphotogasm_zUniversal/persona_010
 ROOT_DIR=~/Documents/dev/jfu/personas
 
 mkdir -p "${BASE_DIR}/masked"

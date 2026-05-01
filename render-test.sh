@@ -40,7 +40,44 @@
 #     --seed 12345 -n 2
 
 # built-in prompts
-uv run python src/render-pseudo-token.py \
-    --token-file experiments/epicphotogasm_zUniversal/pref_007.pt \
-    --guidance 7.5 --cfg-pt 2.2 --cfg-pt-baseline "woman" \
-    --seed 12345 -n 2
+# uv run python src/render-pseudo-token.py \
+#     --token-file experiments/epicphotogasm_zUniversal/pref_007.pt \
+#     --guidance 7.5 --cfg-pt 2.2 --cfg-pt-baseline "woman" \
+#     --seed 12345 -n 2
+
+# uv run python src/render-pseudo-token.py \
+#     --token-file experiments/epicphotogasm_zUniversal/pref_008.pt \
+#     --prompts-file prompts/test-pt.txt \
+#     --init output/seed-2.png --strength 0.85 \
+#     --guidance 6.5 --cfg-pt 2.1 --cfg-pt-baseline "woman" \
+#     --seed 123 -n 3
+
+# blend two PTs with slerp
+# uv run python src/render-pseudo-token.py \
+#     --token-file experiments/epicphotogasm_zUniversal/pref_008.pt \
+#     --token-file-b experiments/epicphotogasm_zUniversal/pref_007.pt \
+#     --blend-mode slerp \
+#     --prompts-file prompts/test-pt.txt \
+#     --init output/seed-2.png --strength 0.85 \
+#     --guidance 6.5 --cfg-pt 2.1 --cfg-pt-baseline "woman" \
+#     --seed 12345 -n 3
+# info:
+#    p.add_argument("--blend-steps", type=int, default=4,
+#                help="Number of intervals in the blend sweep. blend-steps=4 "
+#                     "produces 5 images per prompt at alpha = 0, 1/4, 2/4, 3/4, 1.")
+#    p.add_argument("--blend-tok-name", default="<blend>",
+
+# uv run python src/render-pseudo-token.py \
+#     --token-file experiments/epicphotogasm_zUniversal/pref_007.pt \
+#     --scale 0.95 \
+#     --prompts-file prompts/test-pt.txt \
+#     --init output/seed-2.png --strength 0.85 \
+#     --guidance 6.5 --cfg-pt 2.1 --cfg-pt-baseline "woman" \
+#     --seed 12345 -n 2
+
+# uv run python src/render-pseudo-token.py \
+#     --token-file experiments/epicphotogasm_zUniversal/pref_010.pt \
+#     --prompts-file prompts/test-pt.txt \
+#     --init output/seed-1.png --strength 0.85 \
+#     --guidance 7.5 --cfg-pt 2.4 --cfg-pt-baseline "woman" \
+#     --seed 12345 -n 3
