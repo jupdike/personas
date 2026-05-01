@@ -20,7 +20,7 @@ parser.add_argument("--guidance", type=float, default=7.5, help="Classifier-free
 parser.add_argument("--strength", type=float, default=0.6,
                     help="img2img strength: 0.0 = identity, 1.0 = ignore init image")
 parser.add_argument("-n", type=int, default=1, help="Number of images to generate")
-parser.add_argument("--template_file", type=str, help="Wrap prompts with template and init image, split by |||")
+parser.add_argument("--template-file", type=str, help="Wrap prompts with template and init image, split by |||")
 args = parser.parse_args()
 
 def resolve_seed(s: int) -> int:
