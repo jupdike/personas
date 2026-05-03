@@ -108,9 +108,13 @@ else:
 #             image.save(f"output/{timestamped_filename(f'{stem}-{seed}')}", pnginfo=png_meta)
 
 print(f"<> Found {len(prompts)} prompts.")
-for p in prompts:
+for pix in range(len(prompts)):
+    p = prompts[pix]
+    #print(f"=== Outer-Prompt: {pix + 1} / {len(prompts)} ===")
     print(f"<> Found {len(all_pairs)} prompt pairs (template + prompt).")
-    for t in all_pairs:
+    for tix in range(len(all_pairs)):
+        t = all_pairs[tix]
+        print(f"=== Template-Pair: {pix * len(all_pairs) + tix + 1} / {len(all_pairs) * len(prompts)} ===")
         image = None
         prompt = p
         if t is not None:
