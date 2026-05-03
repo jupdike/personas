@@ -49,9 +49,8 @@ all_pairs = []
 if args.template_file:
     templates = [x.strip().split("|||") for x in open(args.template_file).readlines() if x.strip() != '' and not x.strip().startswith("#")]
     for (image, wrapper) in templates:
-        for p in prompts:
-            im = Image.open(image).convert("RGB").resize((512, 512))
-            all_pairs.append((im, wrapper.replace("{s}", p)))
+        im = Image.open(image).convert("RGB").resize((512, 512))
+        all_pairs.append((im, wrapper))
 elif args.init:
     all_pairs = [(Image.open(args.init).convert("RGB").resize((512, 512)), None)]
 else:
@@ -85,23 +84,46 @@ else:
             generator=generator,
         ).images[0]
 
+# print(f"<> Found {len(all_pairs)} prompt pairs (template + prompt).")
+# print(f"<> Found {len(prompts)} prompts.")
+# for t in all_pairs:
+#     image = None
+#     if t is not None:
+#         print(f"=== Template: {t[1]} ===")
+#         image = t[0]
+#         if t[1] is not None and t[1].strip() != "":
+#             prompts = [t[1]]
+#     for p in prompts:
+#         print(f"=== Prompt: {p} ===")
+#         for i in range(args.n):
+#             seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
+#             parameters = f"Include in Image: {p}; Exclude from Image: {negative_prompt}; Model: {model_name}; Steps: {args.steps}; Guidance Scale: {args.guidance}; Seed: {seed}; Size: 512x512; Scheduler: DPM-Solver++; ML Compute Unit: MPS; Generator: Personas 0.1 + HuggingFace diffusers"
+#             generator = torch.Generator(device="cpu").manual_seed(seed)
+#             image = generate(generator, p, image)
+#             png_meta = PngImagePlugin.PngInfo()
+#             png_meta.add_text("Description", parameters)
+#             png_meta.add_text("parameters", parameters)
+#             png_meta.add_text("Software", "Personas 0.1 + HuggingFace diffusers")
+#             png_meta.add_itxt("XML:com.adobe.xmp", xmp_description_packet(parameters), lang="", tkey="")
+#             image.save(f"output/{timestamped_filename(f'{stem}-{seed}')}", pnginfo=png_meta)
 
-print(f"<> Found {len(all_pairs)} prompt pairs (template + prompt).")
 print(f"<> Found {len(prompts)} prompts.")
-for t in all_pairs:
-    image = None
-    if t is not None:
-        print(f"=== Template: {t[1]} ===")
-        image = t[0]
-        if t[1] is not None and t[1].strip() != "":
-            prompts = [t[1]]
-    for p in prompts:
-        print(f"=== Prompt: {p} ===")
+for p in prompts:
+    print(f"<> Found {len(all_pairs)} prompt pairs (template + prompt).")
+    for t in all_pairs:
+        image = None
+        prompt = p
+        if t is not None:
+            print(f"=== Template: {t[1]} ===")
+            image = t[0]
+            if t[1] is not None and t[1].strip() != "":
+                prompt = t[1].replace("{s}", p)
+            print(f"> === Prompt: {prompt} ===")
         for i in range(args.n):
             seed = resolve_seed(args.seed) + (i if args.seed != 0 else 0)
-            parameters = f"Include in Image: {p}; Exclude from Image: {negative_prompt}; Model: {model_name}; Steps: {args.steps}; Guidance Scale: {args.guidance}; Seed: {seed}; Size: 512x512; Scheduler: DPM-Solver++; ML Compute Unit: MPS; Generator: Personas 0.1 + HuggingFace diffusers"
+            parameters = f"Include in Image: {prompt}; Exclude from Image: {negative_prompt}; Model: {model_name}; Steps: {args.steps}; Guidance Scale: {args.guidance}; Seed: {seed}; Size: 512x512; Scheduler: DPM-Solver++; ML Compute Unit: MPS; Generator: Personas 0.1 + HuggingFace diffusers"
             generator = torch.Generator(device="cpu").manual_seed(seed)
-            image = generate(generator, p, image)
+            image = generate(generator, prompt, image)
             png_meta = PngImagePlugin.PngInfo()
             png_meta.add_text("Description", parameters)
             png_meta.add_text("parameters", parameters)
